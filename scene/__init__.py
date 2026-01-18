@@ -23,10 +23,9 @@ class Scene:
 
     gaussians : GaussianModel
 
-    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
-        """b
-        :param path: Path to colmap scene main folder.
-        """
+
+    def __init__(self, args: ModelParams, gaussians: GaussianModel, load_iteration=None, shuffle=True,
+                 resolution_scales=[1.0]):
         self.model_path = args.model_path
         self.loaded_iter = None
         self.gaussians = gaussians
@@ -42,17 +41,37 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
         self.pseudo_cameras = {}
-        print(args.source_path)
-        if args.source_path.find('replica_few') != -1:
-            print("Found replica path, assuming Replica data set!")
-            scene_info = sceneLoadTypeCallbacks["Replica"](args.source_path, args.images, args.eval, args.n_views, args.rand_pcd)
-        elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
-            print("Found transforms_train.json file, assuming Blender data set!")
+
+        # --- 统一的场景识别与加载逻辑（替换掉原来的两段） ---
+        abs_source_path = os.path.abspath(args.source_path)
+        print(f"正在读取场景路径: {abs_source_path}")
+
+        # 预先检查标志性文件
+        is_replica = args.source_path.find('replica_few') != -1
+        is_blender = os.path.exists(os.path.join(args.source_path, "transforms_train.json"))
+        # 核心改进：同时检查 sparse 文件夹或 poses_bounds.npy
+        is_colmap = os.path.exists(os.path.join(args.source_path, "sparse")) or \
+                    os.path.exists(os.path.join(args.source_path, "poses_bounds.npy"))
+
+        if is_replica:
+            print("识别结果: Replica 数据集")
+            scene_info = sceneLoadTypeCallbacks["Replica"](args.source_path, args.images, args.eval, args.n_views,
+                                                           args.rand_pcd)
+        elif is_blender:
+            print("识别结果: Blender 数据集")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval, True)
-        elif os.path.exists(os.path.join(args.source_path, "sparse")):
+        elif is_colmap:
+            print("识别结果: Colmap/LLFF 数据集")
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, args.n_views)
         else:
+            print(f"错误: 无法识别场景类型。")
+            print(f"检查路径: {abs_source_path}")
+            print(f"是否存在 sparse 目录: {os.path.exists(os.path.join(args.source_path, 'sparse'))}")
+            print(f"是否存在 poses_bounds.npy: {os.path.exists(os.path.join(args.source_path, 'poses_bounds.npy'))}")
             assert False, "Could not recognize scene type!"
+        # ---------------------------------------------------
+
+
 
         if not self.loaded_iter:
             with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
