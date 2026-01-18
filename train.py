@@ -73,25 +73,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
 
+
     # 设置背景颜色：白色背景/黑色背景
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+
     # ---------------------------------高斯预密集化策略（新增）---------------------------------
-    # 若开启预密集化，在训练开始前先对高斯点进行拆分密集化
+    # 将旧的逻辑改为调用 apply_SaGPD
     if pre_densify_args is not None and pre_densify_args['enabled']:
         try:
-            # 执行预密集化：按场景范围拆分高斯，gamma为拆分倍率因子
-            gaussians.pre_densify_split(
-                scene_extent=scene.cameras_extent,  # 场景空间范围（包围盒大小）
-                gamma=pre_densify_args['gamma']  # 密集化倍率（控制拆分后的高斯数量）
+            # 调用 SaGPD 模块
+            gaussians.apply_SaGPD(
+                scene_extent=scene.cameras_extent,
+                K=8,  # KNN 邻居数 [cite: 71]
+                tau_s_quantile=0.7,  # 稀疏度分位数阈值 [cite: 75]
+                gamma_o=0.4,  # 不透明度因子 [cite: 92]
+                delta=1.5  # 尺度缩小系数 [cite: 96]
             )
-            print(f"预密集化完成，当前高斯总数：{gaussians.get_xyz.shape[0]}")
         except torch.cuda.OutOfMemoryError as e:
-            # 捕获显存不足异常，跳过预密集化
-            print(f"预密集化失败：显存不足 - {e}")
-            print("跳过预密集化步骤，继续正常训练...")
-            torch.cuda.empty_cache()  # 清空CUDA缓存
+            print(f"SaGPD 失败：显存不足 - {e}")
+            torch.cuda.empty_cache()
+
 
     # CUDA事件：用于统计单次迭代的耗时
     iter_start = torch.cuda.Event(enable_timing=True)
