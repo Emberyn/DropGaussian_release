@@ -3,5 +3,5 @@
   <component name="Black">
     <option name="sdkName" value="Remote Python 3.10.19 (sftp://root@172.26.14.81:31371/root/miniconda3/envs/DropGaussian/bin/python) (2)" />
   </component>
-  <component name="ProjectRootManager" version="2" project-jdk-name="Remote Python 3.10.19 (sftp://root@172.26.14.81:32366/opt/conda/envs/DropGaussian/bin/python)" project-jdk-type="Python SDK" />
+  <component name="ProjectRootManager" version="2" project-jdk-name="Remote Python 3.10.19 (sftp://root@172.26.14.81:31371/root/miniconda3/envs/DropGaussian/bin/python)" project-jdk-type="Python SDK" />
 </project>
