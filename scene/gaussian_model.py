@@ -216,7 +216,7 @@ class GaussianModel:
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
         # 计算每个点到最近邻的距离（用于初始化缩放参数）
-        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda())[0], 0.0000001)
         # 初始化缩放参数（使用log逆激活）
         scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
         # 初始化旋转参数（单位四元数，无旋转）
@@ -699,152 +699,221 @@ class GaussianModel:
 
 
 
-
-
-
-    # --------------------------------- 高斯致密化增强 ---------------------------------
-    def pre_densify_split(self, scene_extent, gamma=2.0, dense_threshold=0.1, sparse_threshold=0.5):
+    def apply_SaGPD(self, scene_extent, cameras, M=2, K=8, tau_s_quantile=0.7, gamma_o=0.3, delta=1.5, eta_t=0.1):
         """
-        训练前预密集化策略：基于局部密度自适应增加高斯点，提升细节表达能力
+        SaGPD 初始化模块 (完整版) - 稀疏视角3DGS高斯点增密核心函数
+        核心功能：针对稀疏初始点云，通过「长边插值+切平面扰动」生成候选点，再用「多视图一致性」过滤飘点
+        对应论文章节：
+            1. 基于KNN图的长边插值 → PDF 3.3
+            2. 切平面扰动 → PDF 3.4
+            3. 多视图一致性过滤 → PDF 3.6
 
-        Args:
-            scene_extent: 场景范围，用于判断高斯点的稀疏程度
-            gamma: 尺度缩小因子，新高斯的尺度 = 父高斯尺度 / (0.8 * N * gamma)
-            dense_threshold: 密集区域阈值，归一化距离小于此值的点不分裂
-            sparse_threshold: 稀疏区域阈值，大于此值的点生成2个子高斯，否则生成1个
+        参数详解（新手友好）：
+            scene_extent: 场景范围（预留参数，限制高斯点在场景内）
+            cameras: 相机列表（包含投影矩阵等信息，用于多视图可见性判断）
+            M: 多视图过滤阈值（默认2）→ 候选点需被至少M个相机看到才保留，防止飘点
+            K: KNN近邻数（默认8）→ 每个点找K个最近邻居，用于判断稀疏度/拟合切平面
+            tau_s_quantile: 稀疏度分位数阈值（默认0.7）→ 筛选前30%最稀疏的点进行增密
+            gamma_o: 初始不透明度缩放因子（默认0.3）→ 新增点更透明，避免遮挡原有点
+            delta: 尺度缩小系数（默认1.5）→ 新增点尺度比父点小，更精细
+            eta_t: 切平面扰动系数（默认0.1）→ 控制扰动幅度，避免偏离3D表面
         """
-        print(f"\n[预密集化] 开始基于局部密度进行预分裂...")
+        print(f"\n[SaGPD] 开始初始化增密... (Scene Extent: {scene_extent:.4f})")
 
-        # 清理显存，避免OOM
-        torch.cuda.empty_cache()
+        # ===================== 0. 基础数据准备 =====================
+        # 取出所有现有高斯点的3D坐标（形状[N_base, 3]，N_base=初始高斯点总数）
+        xyz = self.get_xyz
+        # 获取坐标张量的设备（CPU/GPU），保证后续计算设备一致
+        device = xyz.device
 
-        # 获取初始高斯点数量
-        n_init_points = self.get_xyz.shape[0]
-        print(f"初始高斯点数量: {n_init_points}")
+        # ===================== 1. 计算KNN近邻与稀疏度（论文3.3） =====================
+        # [cite: 71-75] 对应论文引用行号
+        # 1.1 计算所有点两两之间的3D欧氏距离 → 距离矩阵（形状[N_base, N_base]）
+        dist_matrix = torch.cdist(xyz, xyz)
+        # 1.2 找每个点最近的K+1个点（+1是因为包含自身，后续剔除）
+        # dist_k: 最近K+1个点的距离（[N_base, K+1]）；idx_k: 最近K+1个点的索引（[N_base, K+1]）
+        dist_k, idx_k = torch.topk(dist_matrix, k=K + 1, largest=False)
+        # 1.3 剔除点自身（第0列是自身，距离为0）→ 仅保留K个真实邻居
+        dist_k = dist_k[:, 1:]
+        idx_k = idx_k[:, 1:]
 
-        # 计算每个高斯点到其最近邻的平方距离，然后开方得到实际距离
-        dist = distCUDA2(self.get_xyz)
-        dist = torch.sqrt(dist)  # 转换为欧氏距离
+        # 1.4 计算每个点的局部稀疏度：K个邻居的平均距离（距离越大，点越稀疏）
+        D_i = dist_k.mean(dim=1)
+        # 1.5 归一化稀疏度到0~1范围（消除场景尺度影响，方便阈值筛选）
+        D_min, D_max = D_i.min(), D_i.max()
+        # +1e-12：避免分母为0（数值稳定性小技巧）
+        D_hat = (D_i - D_min) / (D_max - D_min + 1e-12)
 
-        # 使用Robust Min-Max归一化：基于1%和99%分位数，避免异常值影响
-        low_percentile = 1  # 下百分位数
-        high_percentile = 99  # 上百分位数
+        # 1.6 计算稀疏度阈值：取tau_s_quantile分位数（0.7=第70%位置的值）
+        tau_s = torch.quantile(D_hat, tau_s_quantile)
+        # 生成稀疏掩码：True=该点是稀疏点（需增密），False=密集点（不处理）
+        sparse_mask = D_hat > tau_s
+        # 计算目标间距d_t：所有点稀疏度的中位数 → 作为补点的参考间距
+        d_t = torch.median(D_i)
 
-        # 计算分位数
-        dist_lo = torch.quantile(dist, low_percentile / 100.0)
-        dist_hi = torch.quantile(dist, high_percentile / 100.0)
+        print(f"[SaGPD] 稀疏阈值 tau_s: {tau_s:.4f}, 目标间距 d_t: {d_t:.4f}")
 
-        # 将距离值裁剪到分位数范围内
-        dist_clipped = torch.clamp(dist, dist_lo, dist_hi)
+        # ===================== 初始化候选点存储列表 =====================
+        # 临时存储新增候选点的所有参数（后续过滤后再合并到模型）
+        candidate_xyz = []  # 候选点3D坐标
+        candidate_f_dc = []  # 候选点颜色主分量（DC）
+        candidate_f_rest = []  # 候选点颜色细节分量（rest）
+        candidate_scaling = []  # 候选点尺度（大小）
+        candidate_rotation = []  # 候选点旋转（朝向）
+        candidate_opacity = []  # 候选点不透明度
 
-        # 归一化到[0, 1]范围
-        dist_normalized = (dist_clipped - dist_lo) / (dist_hi - dist_lo + 1e-12)
 
-        # 打印距离统计信息
-        print(f"距离统计: min={dist.min():.4f}, max={dist.max():.4f}, mean={dist.mean():.4f}")
-        print(f"Robust归一化使用的范围: [{dist_lo:.4f} (1%), {dist_hi:.4f} (99%)]")
-        print(f"归一化后距离范围: [{dist_normalized.min():.4f}, {dist_normalized.max():.4f}]")
+        # ===================== 2. 生成候选点（长边插值+切平面扰动，论文3.3+3.4） =====================
+        # [cite: 76-84] 对应论文引用行号
+        # 2.1 取出所有稀疏点的索引（需要增密的点）
+        sparse_indices = torch.where(sparse_mask)[0]
+        # 统计生成的候选点数量（用于日志输出）
+        count_generated = 0
 
-        # 统计各密度区间的点数
-        dense_count = (dist_normalized < dense_threshold).sum().item()
-        weak_sparse_count = torch.logical_and(dist_normalized >= dense_threshold,
-                                              dist_normalized <= sparse_threshold).sum().item()
-        strong_sparse_count = (dist_normalized > sparse_threshold).sum().item()
+        # 遍历每个稀疏点i，生成其邻居边的候选点
+        # 注：循环结构为了代码清晰，大规模数据可优化为向量化计算
+        for i in sparse_indices:
+            # 取出稀疏点i的K个邻居点坐标（形状[K, 3]）
+            neighbors_xyz = xyz[idx_k[i]]
 
-        print(f"归一化后分布: 密集区域[0,{dense_threshold}): {dense_count}个点, "
-              f"弱稀疏[{dense_threshold},{sparse_threshold}]: {weak_sparse_count}个点, "
-              f"强稀疏({sparse_threshold},1.0]: {strong_sparse_count}个点")
+            # -------------------- 2.2 PCA拟合切平面（核心：保证扰动沿表面） --------------------
+            # 步骤1：邻居点中心化（减均值）→ 消除位置偏移，聚焦分布特征
+            mean_xyz = neighbors_xyz.mean(dim=0)
+            centered_xyz = neighbors_xyz - mean_xyz
+            # 步骤2：计算协方差矩阵（描述邻居点的分布方向）→ 形状[3, 3]
+            cov = (centered_xyz.T @ centered_xyz) / K
 
-        # 定义不同稀疏程度的掩码
-        # 弱稀疏区域：需要生成1个子高斯
-        weak_sparse_mask = torch.logical_and(dist_normalized >= dense_threshold, dist_normalized <= sparse_threshold)
-        # 强稀疏区域：需要生成2个子高斯
-        strong_sparse_mask = torch.logical_and(dist_normalized > sparse_threshold, dist_normalized <= 1.0)
+            # 步骤3：特征分解（PCA核心）→ 得到特征值(u_eig)和特征向量(v_eig)
+            try:
+                # u_eig: 3个特征值（从小到大）；v_eig: 3个特征向量（列向量）
+                u_eig, v_eig = torch.linalg.eigh(cov)
+                # 切平面由「次小+最大特征值对应的特征向量」张成（沿表面的两个垂直方向）
+                u_base = v_eig[:, 1]  # 次小特征值方向（切平面方向1）
+                v_base = v_eig[:, 2]  # 最大特征值方向（切平面方向2，延展最长）
+            except:
+                # 数值不稳定（如邻居点重合）时跳过该点，避免程序崩溃
+                continue
 
-        # 获取需要分裂的点索引
-        weak_sparse_indices = torch.where(weak_sparse_mask)[0]
-        strong_sparse_indices = torch.where(strong_sparse_mask)[0]
+                # -------------------- 2.3 遍历i的K个邻居j，筛选长边并插值 --------------------
+            for j_idx in range(K):
+                # 取出邻居j的索引
+                j = idx_k[i, j_idx]
+                # 计算i-j边的长度
+                L_ij = dist_matrix[i, j]
 
-        n_weak = weak_sparse_indices.shape[0]
-        n_strong = strong_sparse_indices.shape[0]
+                # 长边判定：仅对超过目标间距1.2倍的边补点（避免密集区无效补点）
+                if L_ij > d_t * 1.2:
+                    # 计算该边需要补的点数m_ij：(边长/目标间距)-1，限制1~3个（防止点膨胀）
+                    # torch.clamp：把值限制在[1,3]，保证至少补1个、最多补3个
+                    m_ij = int(torch.clamp(L_ij / d_t - 1, min=1, max=3))
 
-        print(f"弱稀疏区域: {n_weak}个点 (生成1个子高斯)")
-        print(f"强稀疏区域: {n_strong}个点 (生成2个子高斯)")
-        print(f"预计新增点数: {n_weak * 1 + n_strong * 2}")
+                    # 遍历要补的每个点（r=1到m_ij）
+                    for r in range(1, m_ij + 1):
+                        # 计算插值比例t_r：r/(m_ij+1) → 让新点均匀分布在i-j之间
+                        t_r = r / (m_ij + 1)
 
-        # 如果没有需要分裂的点，直接返回
-        if n_weak == 0 and n_strong == 0:
-            print(f"[预密集化] 未检测到稀疏区域，无需分裂")
+                        # 步骤1：线性插值得到基础位置（无扰动）
+                        mu_lerp = (1 - t_r) * xyz[i] + t_r * xyz[j]
+
+                        # -------------------- 2.4 切平面扰动（论文3.4，防点排成直线） --------------------
+                        # [cite: 89] 对应论文引用行号
+                        # 步骤1：计算扰动幅度（小范围，不偏离表面）
+                        sigma_t = eta_t * d_t
+                        # 步骤2：生成2个正态分布随机数（均值0，标准差sigma_t）
+                        alpha = torch.randn(2, device=device) * sigma_t
+                        # 步骤3：计算切平面内的扰动向量（沿u_base/v_base方向偏移）
+                        epsilon_perp = alpha[0] * u_base + alpha[1] * v_base
+                        # 步骤4：最终候选点坐标 = 插值位置 + 切平面扰动
+                        mu_new = mu_lerp + epsilon_perp
+
+                        # -------------------- 2.5 初始化候选点属性（插值/继承） --------------------
+                        # [cite: 90-96] 对应论文引用行号
+                        # 2.5.1 存储3D坐标
+                        candidate_xyz.append(mu_new)
+
+                        # 2.5.2 颜色插值（和坐标插值比例一致，保证颜色自然过渡）
+                        candidate_f_dc.append((1 - t_r) * self._features_dc[i] + t_r * self._features_dc[j])
+                        candidate_f_rest.append((1 - t_r) * self._features_rest[i] + t_r * self._features_rest[j])
+
+                        # 2.5.3 不透明度初始化（父点i的不透明度×gamma_o，更透明避免遮挡）
+                        # inverse_opacity_activation：反激活函数，还原到原始参数空间
+                        candidate_opacity.append(self.inverse_opacity_activation(self.get_opacity[i] * gamma_o))
+
+                        # 2.5.4 尺度初始化（父点i的尺度缩小，对数空间减法等价于原始空间除法）
+                        scale_new = self._scaling[i] - torch.log(
+                            torch.tensor(delta * (m_ij + 1) ** 0.5, device=device))
+                        candidate_scaling.append(scale_new)
+
+                        # 2.5.5 旋转初始化（直接继承父点i，简单高效，朝向一致）
+                        candidate_rotation.append(self._rotation[i])
+
+                        # 候选点计数+1
+                        count_generated += 1
+
+        print(f"[SaGPD] 生成了 {count_generated} 个候选点，开始多视图一致性过滤...")
+
+        # 无候选点时直接返回，避免后续计算报错
+        if count_generated == 0:
             return
 
-        # 合并所有需要分裂的索引，并记录每个点的分裂数量
-        all_indices = []
-        all_N_values = []
+        # ===================== 3. 多视图一致性过滤（论文3.6，核心防飘点） =====================
+        # [cite: 53-56] 对应论文引用行号
+        # 核心公式 (8): |{c | pi(mu) in Omega}| >= M → 候选点需被至少M个相机看到才保留
+        # 3.1 转换候选点为张量，方便批量处理（形状[N_new, 3]，N_new=候选点总数）
+        cand_xyz_tensor = torch.stack(candidate_xyz)
+        N_new = cand_xyz_tensor.shape[0]
 
-        # 弱稀疏区域：每个点生成1个子高斯
-        if n_weak > 0:
-            all_indices.append(weak_sparse_indices)
-            all_N_values.extend([1] * n_weak)
+        # 3.2 初始化可见计数器：统计每个候选点被多少个相机看到（初始为0）
+        visible_counts = torch.zeros(N_new, dtype=torch.int32, device=device)
 
-        # 强稀疏区域：每个点生成2个子高斯
-        if n_strong > 0:
-            all_indices.append(strong_sparse_indices)
-            all_N_values.extend([2] * n_strong)
+        # 3.3 批量计算候选点在所有相机中的可见性（无梯度计算，节省显存）
+        with torch.no_grad():
+            # 步骤1：将3D坐标转换为齐次坐标（[x,y,z] → [x,y,z,1]），适配投影矩阵计算
+            # 形状[N_new, 4]，齐次坐标是3D投影到2D的标准操作
+            ones = torch.ones((N_new, 1), device=device)
+            cand_xyz_hom = torch.cat([cand_xyz_tensor, ones], dim=1)
 
-        # 合并索引和分裂数量
-        selected_indices = torch.cat(all_indices, dim=0)
-        all_N_values = torch.tensor(all_N_values, device="cuda", dtype=torch.long)
+            # 遍历每个相机，判断候选点是否在该相机视锥体内
+            for cam in cameras:
+                # 步骤2：世界坐标 → 裁剪空间（Clip Space）
+                # cam.full_proj_transform: 相机完整投影矩阵（4,4），包含内参+外参
+                # 矩阵乘法：[N_new,4] @ [4,4] → [N_new,4]，得到裁剪空间坐标
+                p_clip = cand_xyz_hom @ cam.full_proj_transform
 
-        # 批量获取选中点的所有属性
-        selected_xyz = self.get_xyz[selected_indices]  # [n_selected, 3]
-        selected_scaling = self.get_scaling[selected_indices]  # [n_selected, 3]
-        selected_rotation = self._rotation[selected_indices]  # [n_selected, 4]
-        selected_features_dc = self._features_dc[selected_indices]  # [n_selected, 1, 3]
-        selected_features_rest = self._features_rest[selected_indices]  # [n_selected, ?, 3]
+                # 步骤3：透视除法 → 转换到NDC空间（标准化设备坐标）
+                # p_w: 齐次坐标的w分量，+1e-7避免除以0
+                p_w = p_clip[:, 3:4] + 1e-7
+                # NDC坐标：x/y/z ∈ [-1,1] 表示在视锥体内
+                p_ndc = p_clip[:, :3] / p_w
 
-        # 清理不再需要的变量，节省显存
-        del dist, dist_clipped, dist_normalized, weak_sparse_mask, strong_sparse_mask
-        torch.cuda.empty_cache()
+                # 步骤4：判断候选点是否在相机视锥体内（可见性）
+                # 条件1：x/y在[-1,1]范围内（在图像平面内）
+                # 条件2：w>0（点在相机前方，不是在相机背后）
+                in_view_mask = (p_ndc[:, 0] >= -1.0) & (p_ndc[:, 0] <= 1.0) & \
+                               (p_ndc[:, 1] >= -1.0) & (p_ndc[:, 1] <= 1.0) & \
+                               (p_w[:, 0] > 0)
 
-        # 计算总新点数
-        total_new_points = all_N_values.sum().item()
+                # 累计可见计数：该相机可见的点，计数器+1
+                visible_counts += in_view_mask.int()
 
-        # 批量生成新高斯点的位置（基于父高斯的尺度进行正态分布采样）
-        stds = selected_scaling.repeat_interleave(all_N_values, dim=0)  # [total_new_points, 3]
-        means = torch.zeros((total_new_points, 3), device="cuda")
-        samples = torch.normal(mean=means, std=stds)  # 生成随机偏移
+        # 3.4 应用过滤阈值M：仅保留被至少M个相机看到的点（剔除飘点）
+        keep_mask = visible_counts >= M
+        # 统计最终保留的点数
+        final_count = keep_mask.sum().item()
+        print(
+            f"[SaGPD] 过滤结果: {count_generated} -> {final_count} (丢弃 {count_generated - final_count} 个漂浮点)")
 
-        # 批量应用父高斯的旋转变换
-        selected_rotation_expanded = selected_rotation.repeat_interleave(all_N_values, dim=0)  # [total_new_points, 4]
-        rots = build_rotation(selected_rotation_expanded)  # 转换为旋转矩阵 [total_new_points, 3, 3]
-        selected_xyz_expanded = selected_xyz.repeat_interleave(all_N_values, dim=0)  # 父点位置重复
+        # ===================== 4. 合并保留的候选点到模型 =====================
+        if final_count > 0:
+            # 调用模型内置函数，将过滤后的新点合并到现有高斯模型中
+            self.densification_postfix(
+                cand_xyz_tensor[keep_mask],  # 过滤后的3D坐标
+                torch.stack(candidate_f_dc)[keep_mask],  # 过滤后的颜色DC
+                torch.stack(candidate_f_rest)[keep_mask],  # 过滤后的颜色rest
+                torch.stack(candidate_opacity)[keep_mask],  # 过滤后的不透明度
+                torch.stack(candidate_scaling)[keep_mask],  # 过滤后的尺度
+                torch.stack(candidate_rotation)[keep_mask]  # 过滤后的旋转
+            )
 
-        # 计算新点的最终位置：旋转偏移 + 父点位置
-        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + selected_xyz_expanded
-
-        # 计算新点的缩放参数（更小的尺度）
-        N_expanded = all_N_values.repeat_interleave(all_N_values, dim=0).float()  # 每个新点对应的分裂数
-        new_scaling = self.scaling_inverse_activation(stds / (0.8 * N_expanded.unsqueeze(1) * gamma))
-
-        # 继承父点的其他属性
-        new_rotation = selected_rotation_expanded
-        new_features_dc = selected_features_dc.repeat_interleave(all_N_values, dim=0)
-        new_features_rest = selected_features_rest.repeat_interleave(all_N_values, dim=0)
-        # 初始化新点的不透明度（略低于初始值）
-        new_opacity = inverse_sigmoid(0.08 * torch.ones((total_new_points, 1), dtype=torch.float, device="cuda"))
-
-        # 清理中间变量
-        del stds, means, samples, rots, selected_xyz_expanded, selected_rotation_expanded, N_expanded
-        del selected_xyz, selected_scaling, selected_rotation, selected_features_dc, selected_features_rest, all_N_values
-        torch.cuda.empty_cache()
-
-        # 将新生成的高斯点添加到模型中
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest,
-                                   new_opacity, new_scaling, new_rotation)
-
-        # 打印统计信息
-        print(f"[预密集化] 完成！新增 {total_new_points} 个高斯点")
-        print(f"[预密集化] 总高斯点数量: {self.get_xyz.shape[0]}")
-
-        # 最终清理显存
+        # 清空GPU缓存，释放临时数据（避免显存泄漏）
         torch.cuda.empty_cache()
