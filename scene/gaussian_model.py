@@ -699,99 +699,104 @@ class GaussianModel:
 
 
 
+
+
+        # --------------------------------- SaGPD: 邻域稀疏度引导的致密化 ---------------------------------
     def apply_SaGPD(self, scene_extent, K=8, tau_s_quantile=0.7, gamma_o=0.3, delta=1.5, eta_t=0.1):
         """
-        SaGPD A++ 去噪版：
-        1. 表面可靠性过滤：通过 PCA 特征值比例，剔除在“噪声点团”中的插值。
-        2. 唯一边去重 + 硬预算截断。
-        3. 仅在真正具有“表面特征”的区域补点，提升稀疏视图的泛化性。
+        SaGPD 初始化模块：基于 KNN 图的长边插值与切平面扰动 [cite: 67, 80, 88]
         """
+        print(f"\n[SaGPD] 开始初始化增密...")
         torch.cuda.empty_cache()
+
         xyz = self.get_xyz
-        N_base = xyz.shape[0]
+        N = xyz.shape[0]
 
-        MAX_TOTAL_POINTS = 60000
-        budget = MAX_TOTAL_POINTS - N_base
-        if budget <= 0: return
-
-        # 邻域分析
-        dist_matrix = torch.cdist(xyz, xyz)
+        # 1. 计算 KNN 距离 [cite: 71, 72]
+        # 注意：对于大规模点云，建议使用分块计算或更高效的 KNN 库
+        dist_matrix = torch.cdist(xyz, xyz)  # [N, N]
         dist_k, idx_k = torch.topk(dist_matrix, k=K + 1, largest=False)
-        dist_k, idx_k = dist_k[:, 1:], idx_k[:, 1:]
-        D_i = dist_k.mean(dim=1)
-        d_t = torch.median(D_i)
+        dist_k = dist_k[:, 1:]  # 排除自身
+        idx_k = idx_k[:, 1:]
 
-        D_hat = (D_i - D_i.min()) / (D_i.max() - D_i.min() + 1e-12)
+        # 2. 局部稀疏度度量 D_i [cite: 72, 73]
+        D_i = dist_k.mean(dim=1)
+        D_min, D_max = D_i.min(), D_i.max()
+        D_hat = (D_i - D_min) / (D_max - D_min + 1e-12)
+
+        # 3. 触发条件：使用分位数阈值 tau_s [cite: 75]
         tau_s = torch.quantile(D_hat, tau_s_quantile)
         sparse_mask = D_hat > tau_s
 
-        candidates = []
-        sparse_indices = torch.where(sparse_mask)[0]
-
-        for i in sparse_indices:
-            # --- 关键改进：表面可靠性检查 ---
-            neighbors_xyz = xyz[idx_k[i]]
-            centered = neighbors_xyz - neighbors_xyz.mean(dim=0)
-            cov = (centered.T @ centered) / K
-            # u_eig 是特征值（从小到大），v_eig 是特征向量
-            u_eig, v_eig = torch.linalg.eigh(cov)
-
-            # 计算平面度 (Planarity Score): 1 - (最小特征值 / 平均特征值)
-            # 如果 planarity 接近 1，说明非常平；如果接近 0，说明是球状噪声
-            planarity = 1.0 - (u_eig[0] / (u_eig.mean() + 1e-12))
-
-            # 只有当邻域看起来像一个平面时 (阈值 0.8)，才允许从这个点出发寻找长边
-            if planarity < 0.8:
-                continue
-
-            u_base, v_base = v_eig[:, 1], v_eig[:, 2]
-
-            for j_idx in range(K):
-                j = idx_k[i, j_idx]
-                if i < j:
-                    L_ij = dist_matrix[i, j].item()
-                    if L_ij > d_t.item() * 1.2:
-                        candidates.append({
-                            'length': L_ij, 'i': i.item(), 'j': j.item(),
-                            'u': u_base, 'v': v_base
-                        })
-
-        # 按长度排序
-        candidates = sorted(candidates, key=lambda x: x['length'], reverse=True)
+        # 目标间距 d_t [cite: 77]
+        d_t = torch.median(D_i)
 
         new_xyz_list, new_features_dc_list, new_features_rest_list = [], [], []
         new_scaling_list, new_rotation_list, new_opacity_list = [], [], []
 
-        added_count = 0
-        for edge in candidates:
-            if added_count >= budget: break
-            i, j, L_ij = edge['i'], edge['j'], edge['length']
-            m_ij = int(torch.clamp(torch.tensor(L_ij / d_t.item() - 1), min=1, max=3))
+        # 4. 遍历稀疏区域的边进行插值 [cite: 76, 80]
+        sparse_indices = torch.where(sparse_mask)[0]
+        for i in sparse_indices:
+            # 获取该点的邻域点用于 PCA [cite: 88]
+            neighbors_xyz = xyz[idx_k[i]]  # [K, 3]
 
-            for r in range(1, m_ij + 1):
-                if added_count >= budget: break
-                t_r = r / (m_ij + 1)
-                mu_lerp = (1 - t_r) * xyz[i] + t_r * xyz[j]
+            # 计算切平面正交基 (u, v) - 通过 PCA 拟合 [cite: 88]
+            mean_xyz = neighbors_xyz.mean(dim=0)
+            centered_xyz = neighbors_xyz - mean_xyz
+            # 协方差矩阵的特征分解
+            cov = (centered_xyz.T @ centered_xyz) / K
+            u_eig, v_eig = torch.linalg.eigh(cov)
+            normal = v_eig[:, 0]  # 最小特征值对应的特征向量为法向
+            # 构造切平面正交基 (取与法向正交的任意两个向量)
+            u_base = v_eig[:, 1]
+            v_base = v_eig[:, 2]
 
-                # 使用预存的 PCA 基向量
-                alpha = torch.randn(2, device="cuda") * (eta_t * d_t)
-                mu_new = mu_lerp + alpha[0] * edge['u'] + alpha[1] * edge['v']
+            for j_idx in range(K):
+                j = idx_k[i, j_idx]
+                L_ij = dist_matrix[i, j]
 
-                new_xyz_list.append(mu_new)
-                new_features_dc_list.append((1 - t_r) * self._features_dc[i] + t_r * self._features_dc[j])
-                new_features_rest_list.append((1 - t_r) * self._features_rest[i] + t_r * self._features_rest[j])
-                new_opacity_list.append(self.inverse_opacity_activation(self.get_opacity[i] * gamma_o))
-                scale_new = self._scaling[i] - torch.log(torch.tensor(delta * (m_ij + 1) ** 0.5, device="cuda"))
-                new_scaling_list.append(scale_new)
-                new_rotation_list.append(self._rotation[i])
-                added_count += 1
+                # 如果边长超过目标间距，触发插值 [cite: 78, 80]
+                if L_ij > d_t * 1.2:
+                    m_ij = int(torch.clamp(L_ij / d_t - 1, min=1, max=3))  # 限制新增点数防止膨胀 [cite: 78, 203]
 
-        if added_count > 0:
+                    for r in range(1, m_ij + 1):
+                        t_r = r / (m_ij + 1)
+                        # A. 边插值位置 [cite: 81, 84]
+                        mu_lerp = (1 - t_r) * xyz[i] + t_r * xyz[j]
+
+                        # B. 切平面扰动 [cite: 81, 89]
+                        sigma_t = eta_t * d_t
+                        alpha = torch.randn(2, device="cuda") * sigma_t
+                        epsilon_perp = alpha[0] * u_base + alpha[1] * v_base
+
+                        mu_new = mu_lerp + epsilon_perp
+                        new_xyz_list.append(mu_new)
+
+                        # 5. 参数初始化 [cite: 90, 92, 96]
+                        # 颜色插值
+                        f_dc_new = (1 - t_r) * self._features_dc[i] + t_r * self._features_dc[j]
+                        f_rest_new = (1 - t_r) * self._features_rest[i] + t_r * self._features_rest[j]
+                        new_features_dc_list.append(f_dc_new)
+                        new_features_rest_list.append(f_rest_new)
+
+                        # 不透明度设置 o_new = gamma_o * o_i [cite: 92]
+                        new_opacity_list.append(self.inverse_opacity_activation(self.get_opacity[i] * gamma_o))
+
+                        # 尺度缩小 s_new = s_i / (delta * sqrt(N_i+1)) [cite: 96]
+                        # 此处 N_i 取该点触发的平均新增数
+                        scale_new = self._scaling[i] - torch.log(torch.tensor(delta * (m_ij + 1) ** 0.5, device="cuda"))
+                        new_scaling_list.append(scale_new)
+
+                        # 旋转继承
+                        new_rotation_list.append(self._rotation[i])
+
+        if len(new_xyz_list) > 0:
+            # 合并并更新模型
             self.densification_postfix(
                 torch.stack(new_xyz_list), torch.stack(new_features_dc_list),
                 torch.stack(new_features_rest_list), torch.stack(new_opacity_list),
                 torch.stack(new_scaling_list), torch.stack(new_rotation_list)
             )
-            print(f"[SaGPD] 过滤后精准增密完成！新增: {len(new_xyz_list)}, 最终点数: {self.get_xyz.shape[0]}")
+            print(f"[SaGPD] 完成！新增 {len(new_xyz_list)} 个高斯点，总数: {self.get_xyz.shape[0]}")
 
         torch.cuda.empty_cache()
