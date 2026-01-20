@@ -20,7 +20,6 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2  # CUDA加速的KNN距离计算
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
-from gaussian_renderer import render
 
 
 class GaussianModel:
@@ -217,7 +216,7 @@ class GaussianModel:
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
         # 计算每个点到最近邻的距离（用于初始化缩放参数）
-        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda())[0], 0.0000001)
         # 初始化缩放参数（使用log逆激活）
         scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
         # 初始化旋转参数（单位四元数，无旋转）
@@ -697,9 +696,6 @@ class GaussianModel:
         # 累积计数
         self.denom[update_filter] += 1
 
-
-
-
     @torch.no_grad()
     def apply_SaGPD(self, scene, pipe, background,
                     knn_neighbors=8,
@@ -710,126 +706,167 @@ class GaussianModel:
                     min_views=2,
                     depth_error=0.01):
         """
-        SaGPD A++ 去噪增强版 (语义化参数实现)
-        1. 表面可靠性过滤 (基于 PCA 平面度)
-        2. 多视图几何一致性校验 (通过批量深度图采样)
-        3. 属性自适应插值与初始化
+        SaGPD A++ (修复版): 修正了矩阵乘法逻辑，并优化显存占用。
         """
-        from gaussian_renderer import render  # 局部导入防止循环引用
+        import math
+        from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+        from tqdm import tqdm  # 导入进度条
 
         torch.cuda.empty_cache()
         xyz = self.get_xyz
         N_base = xyz.shape[0]
 
-        # 设定硬预算上限，防止预致密化点数过多撑爆显存
         MAX_TOTAL_POINTS = 100000
         budget = MAX_TOTAL_POINTS - N_base
         if budget <= 0:
             print("[SaGPD] 当前点数已达上限，跳过增密。")
             return
 
-        # --- 阶段 1: 预渲染所有训练视角的深度图作为几何参考 ---
+        # --- 阶段 1: 预渲染所有训练视角的深度图 ---
+        print(f"[SaGPD] 正在生成深度图参考...")
         train_cameras = scene.getTrainCameras()
         ref_depths = []
-        for cam in train_cameras:
-            # 仅渲染深度信息，覆盖颜色为零以提升速度
-            d_pkg = render(cam, self, pipe, background, override_color=torch.zeros(3, device="cuda"))
-            ref_depths.append(d_pkg["render_depth"])  # 需确保渲染器支持返回 render_depth
 
-        # --- 阶段 2: 邻域分析与稀疏度评估 ---
+        means3D = self.get_xyz
+        opacity = self.get_opacity
+        scales = self.get_scaling
+        rotations = self.get_rotation
+
+        # 预计算齐次坐标，避免循环内重复计算
+        means3D_homo = torch.cat([means3D, torch.ones_like(means3D[:, :1])], dim=-1)
+
+        # 使用 tqdm 显示进度
+        for cam in tqdm(train_cameras, desc="Rendering Depths"):
+            tanfovx = math.tan(cam.FoVx * 0.5)
+            tanfovy = math.tan(cam.FoVy * 0.5)
+
+            raster_settings = GaussianRasterizationSettings(
+                image_height=int(cam.image_height),
+                image_width=int(cam.image_width),
+                tanfovx=tanfovx,
+                tanfovy=tanfovy,
+                bg=torch.zeros(3, device="cuda"),
+                scale_modifier=1.0,
+                viewmatrix=cam.world_view_transform,
+                projmatrix=cam.full_proj_transform,
+                sh_degree=0,
+                campos=cam.camera_center,
+                prefiltered=False,
+                debug=False
+            )
+
+            rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
+            # === [关键修复] ===
+            # cam.world_view_transform 已经是转置好的 (N,4) @ (4,4) 形式
+            # 不要再 transpose(0, 1) 了！
+            means3D_cam = (means3D_homo @ cam.world_view_transform)
+            depths = means3D_cam[:, 2:3]  # 取 Z 轴作为深度
+
+            means2D = torch.zeros_like(means3D, dtype=means3D.dtype, requires_grad=False, device="cuda")
+
+            depth_image, _ = rasterizer(
+                means3D=means3D,
+                means2D=means2D,
+                shs=None,
+                colors_precomp=depths.repeat(1, 3),
+                opacities=opacity,
+                scales=scales,
+                rotations=rotations,
+                cov3D_precomp=None
+            )
+
+            # === [显存优化] ===
+            # 将深度图移到 CPU，释放 GPU 显存，防止 OOM
+            ref_depths.append(depth_image[0:1].cpu())
+
+        # 清理渲染占用
+        torch.cuda.empty_cache()
+
+        # --- 阶段 2: 邻域分析 ---
+        print("[SaGPD] 分析几何特征...")
         dist_matrix = torch.cdist(xyz, xyz)
         dist_k, idx_k = torch.topk(dist_matrix, k=knn_neighbors + 1, largest=False)
-        dist_k, idx_k = dist_k[:, 1:], idx_k[:, 1:]  # 剔除自身
+        dist_k, idx_k = dist_k[:, 1:], idx_k[:, 1:]
         D_i = dist_k.mean(dim=1)
-        d_t = torch.median(D_i)  # 局部基准距离
+        d_t = torch.median(D_i)
 
-        # 计算稀疏得分并提取稀疏索引
         D_hat = (D_i - D_i.min()) / (D_i.max() - D_i.min() + 1e-12)
         tau_s = torch.quantile(D_hat, sparsity_threshold)
         sparse_indices = torch.where(D_hat > tau_s)[0]
 
-        # --- 阶段 3: PCA 表面特征提取与候选边选择 ---
+        # --- 阶段 3: 候选点生成 ---
         pre_candidates = []
         for i in sparse_indices:
             neighbors_xyz = xyz[idx_k[i]]
             centered = neighbors_xyz - neighbors_xyz.mean(dim=0)
             cov = (centered.T @ centered) / knn_neighbors
-            u_eig, v_eig = torch.linalg.eigh(cov)  # 特征值升序排列
+            u_eig, v_eig = torch.linalg.eigh(cov)
 
-            # 平面度判定 (1 - 最小特征值/平均特征值)
             planarity = 1.0 - (u_eig[0] / (u_eig.mean() + 1e-12))
-            if planarity < 0.8:  # 剔除球状噪声团块
-                continue
+            if planarity < 0.8: continue
 
-            # 提取切平面基向量 (对应两个较大的特征值)
             u_base, v_base = v_eig[:, 1], v_eig[:, 2]
 
             for j_idx in range(knn_neighbors):
                 j = idx_k[i, j_idx]
                 if i < j:
                     L_ij = dist_matrix[i, j].item()
-                    if L_ij > d_t.item() * 1.2:  # 仅对大于基准距离的“长边”插值
+                    if L_ij > d_t.item() * 1.2:
                         pre_candidates.append({
                             'i': i.item(), 'j': j.item(), 'L': L_ij,
                             'u': u_base, 'v': v_base
                         })
 
-        # 按边长度排序，优先处理最稀疏的区域
         pre_candidates = sorted(pre_candidates, key=lambda x: x['L'], reverse=True)[:budget * 2]
 
-        # --- 阶段 4: 批量生成候选点位置并执行多视图校验 ---
+        # --- 阶段 4: 多视图一致性校验 ---
         tmp_xyz_list = []
         meta_info = []
 
         for edge in pre_candidates:
-            # 计算每条边需要插值的点数
             m_ij = int(torch.clamp(torch.tensor(edge['L'] / d_t.item() - 1), min=1, max=3))
             for r in range(1, m_ij + 1):
                 t_r = r / (m_ij + 1)
                 mu_lerp = (1 - t_r) * xyz[edge['i']] + t_r * xyz[edge['j']]
-
-                # 在切平面内加入扰动偏移
                 alpha = torch.randn(2, device="cuda") * (perturb_strength * d_t)
                 mu_new = mu_lerp + alpha[0] * edge['u'] + alpha[1] * edge['v']
-
                 tmp_xyz_list.append(mu_new)
                 meta_info.append({'i': edge['i'], 'j': edge['j'], 't_r': t_r, 'm_ij': m_ij})
 
         if not tmp_xyz_list:
-            print("[SaGPD] 未找到符合几何特征的候选点。")
+            print("[SaGPD] 未找到符合条件的候选点。")
             return
 
-        all_mu_new = torch.stack(tmp_xyz_list)  # [N_candidates, 3]
+        all_mu_new = torch.stack(tmp_xyz_list)
         consistency_count = torch.zeros(all_mu_new.shape[0], device="cuda")
 
-        # 批量计算几何一致性支持度
+        print("[SaGPD] 执行多视图一致性校验...")
+        p_homo = torch.cat([all_mu_new, torch.ones(all_mu_new.shape[0], 1, device="cuda")], dim=-1)
+
         for idx, cam in enumerate(train_cameras):
-            # 将候选点投影到相机坐标系
-            p_homo = torch.cat([all_mu_new, torch.ones(all_mu_new.shape[0], 1, device="cuda")], dim=-1)
             p_cam = (p_homo @ cam.full_proj_transform)
+            z_new = p_cam[:, 2]
+            ndc_x = p_cam[:, 0] / p_cam[:, 3]
+            ndc_y = p_cam[:, 1] / p_cam[:, 3]
 
-            z_new = p_cam[:, 2]  # 投影深度
-            ix = ((p_cam[:, 0] / p_cam[:, 3] + 1.0) * cam.image_width - 1.0) * 0.5
-            iy = ((p_cam[:, 1] / p_cam[:, 3] + 1.0) * cam.image_height - 1.0) * 0.5
-
-            # 屏幕范围内的有效掩码
-            mask = (ix >= 0) & (ix < cam.image_width) & (iy >= 0) & (iy < cam.image_height) & (z_new > 0)
+            mask = (ndc_x >= -1) & (ndc_x <= 1) & (ndc_y >= -1) & (ndc_y <= 1) & (z_new > 0)
 
             if mask.any():
-                # 使用双线性插值采样参考深度图
-                grid_x = (ix[mask] / (cam.image_width - 1) * 2) - 1
-                grid_y = (iy[mask] / (cam.image_height - 1) * 2) - 1
-                grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0).unsqueeze(0)
+                grid = torch.stack([ndc_x[mask], ndc_y[mask]], dim=-1).unsqueeze(0).unsqueeze(0)
+
+                # 从 CPU 取回深度图到 GPU 进行采样
+                curr_depth_map = ref_depths[idx].to("cuda")
 
                 z_ref = torch.nn.functional.grid_sample(
-                    ref_depths[idx].unsqueeze(0), grid, align_corners=True
+                    curr_depth_map.unsqueeze(0), grid, align_corners=True, padding_mode="border"
                 ).squeeze()
 
-                # 深度一致性判定
-                consistent_mask = torch.abs(z_new[mask] - z_ref) < depth_error
+                dist_diff = torch.abs(z_new[mask] - z_ref)
+                consistent_mask = dist_diff < (z_ref * depth_error + 0.05)
                 consistency_count[torch.where(mask)[0][consistent_mask]] += 1
 
-        # --- 阶段 5: 根据校验结果筛选并添加高斯点 ---
+        # --- 阶段 5: 筛选与添加 ---
         valid_mask = consistency_count >= min_views
         final_indices = torch.where(valid_mask)[0][:budget]
 
@@ -838,14 +875,10 @@ class GaussianModel:
         for idx in final_indices:
             m = meta_info[idx]
             i, j, t_r = m['i'], m['j'], m['t_r']
-
             new_xyz.append(all_mu_new[idx])
-            # 颜色与 SH 系数线性插值
             new_dc.append((1 - t_r) * self._features_dc[i] + t_r * self._features_dc[j])
             new_rest.append((1 - t_r) * self._features_rest[i] + t_r * self._features_rest[j])
-            # 不透明度比例缩放初始化
             new_opac.append(self.inverse_opacity_activation(self.get_opacity[i] * opacity_scale))
-            # 尺寸基于插值密度缩小，防止重叠
             s_base = self._scaling[i]
             scale_val = s_base - torch.log(torch.tensor(size_shrink * (m['m_ij'] + 1) ** 0.5, device="cuda"))
             new_scale.append(scale_val)
@@ -856,6 +889,8 @@ class GaussianModel:
                 torch.stack(new_xyz), torch.stack(new_dc), torch.stack(new_rest),
                 torch.stack(new_opac), torch.stack(new_scale), torch.stack(new_rot)
             )
-            print(f"[SaGPD] 预密集化完成！校验保留点: {len(new_xyz)}, 总点数: {self.get_xyz.shape[0]}")
+            print(f"[SaGPD] 预密集化完成！新增点数: {len(new_xyz)}, 总点数: {self.get_xyz.shape[0]}")
+        else:
+            print("[SaGPD] 校验完成，没有点通过一致性测试。")
 
         torch.cuda.empty_cache()
