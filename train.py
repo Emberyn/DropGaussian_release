@@ -79,17 +79,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
 
-    # ---------------------------------高斯预密集化策略（新增）---------------------------------
-    # 将旧的逻辑改为调用 apply_SaGPD
+
+    # ---------------------------------高斯预密集化策略---------------------------------
     if pre_densify_args is not None and pre_densify_args['enabled']:
         try:
-            # 调用 SaGPD 模块
+            print(f"[SaGPD] 正在执行预密集化校验...")
             gaussians.apply_SaGPD(
-                scene_extent=scene.cameras_extent,
-                K=8,  # KNN 邻居数 [cite: 71]
-                tau_s_quantile=0.7,  # 稀疏度分位数阈值 [cite: 75]
-                gamma_o=0.4,  # 不透明度因子 [cite: 92]
-                delta=1.5  # 尺度缩小系数 [cite: 96]
+                scene=scene,
+                pipe=pipe,
+                background=background,
+                knn_neighbors=pre_densify_args['knn_neighbors'],
+                sparsity_threshold=pre_densify_args['sparsity_threshold'],
+                opacity_scale=pre_densify_args['opacity_scale'],
+                size_shrink=pre_densify_args['size_shrink'],
+                perturb_strength=pre_densify_args['perturb_strength'],
+                min_views=pre_densify_args['min_views'],
+                depth_error=pre_densify_args['depth_error']
             )
         except torch.cuda.OutOfMemoryError as e:
             print(f"SaGPD 失败：显存不足 - {e}")
@@ -386,9 +391,17 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[], help="保存检查点的迭代次数")
     parser.add_argument("--start_checkpoint", type=str, default=None, help="断点续训的检查点路径")
 
-    # --- 新增自定义参数（师兄命令） ---
-    parser.add_argument("--pre_densify", action="store_true", help="开启高斯预密集化（训练前拆分高斯）")
-    parser.add_argument("--pre_gamma", type=float, default=2.0, help="预密集化倍率因子（控制拆分数量）")
+
+    # --- 新增自定义参数（SaGPD 预致密化模块）
+    parser.add_argument("--pre_densify", action="store_true", help="是否开启预致密化 (SaGPD)")
+    parser.add_argument("--pre_knn_neighbors", type=int, default=8, help="KNN邻域搜索数量")
+    parser.add_argument("--pre_sparsity_threshold", type=float, default=0.7, help="稀疏度判定阈值(分位数)")
+    parser.add_argument("--pre_opacity_scale", type=float, default=0.3, help="新增点的不透明度缩放系数")
+    parser.add_argument("--pre_size_shrink", type=float, default=1.5, help="新增点的尺寸缩小比例因子")
+    parser.add_argument("--pre_perturb_strength", type=float, default=0.1, help="在表面切平面内的位置扰动强度")
+    parser.add_argument("--pre_min_consistency_views", type=int, default=2, help="多视图一致性校验所需的最小视角数")
+    parser.add_argument("--pre_depth_error_limit", type=float, default=0.01, help="深度一致性判定的最大误差容限")
+
 
     # 解析命令行参数
     args = parser.parse_args(sys.argv[1:])
@@ -403,10 +416,16 @@ if __name__ == "__main__":
     # --- 关键修改：补全数据集参数 ---
     dataset_args = lp.extract(args)
 
-    # 构造预密集化参数字典
+    # 构造预密集化参数字典（使用新键名）
     pre_densify_args = {
-        'enabled': args.pre_densify,  # 是否开启预密集化
-        'gamma': args.pre_gamma  # 密集化倍率
+        'enabled': args.pre_densify,
+        'knn_neighbors': args.pre_knn_neighbors,
+        'sparsity_threshold': args.pre_sparsity_threshold,
+        'opacity_scale': args.pre_opacity_scale,
+        'size_shrink': args.pre_size_shrink,
+        'perturb_strength': args.pre_perturb_strength,
+        'min_views': args.pre_min_consistency_views,
+        'depth_error': args.pre_depth_error_limit
     }
 
     # 启动GUI服务器（用于可视化训练过程）

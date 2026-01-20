@@ -1,36 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" autoUpload="Always" serverName="root@172.26.14.81:31371 password (4)" remoteFilesAllowedToDisappearOnAutoupload="false">
+  <component name="PublishConfigData" autoUpload="Always" serverName="root@172.26.14.81:32366 password" remoteFilesAllowedToDisappearOnAutoupload="false">
     <serverData>
-      <paths name="root@172.26.14.81:31371 password">
+      <paths name="root@172.26.14.81:32366 password">
         <serverdata>
           <mappings>
-            <mapping deploy="/home/MAtCha/DropGaussian_release" local="$PROJECT_DIR$" />
+            <mapping deploy="/home/DropGaussian_release" local="$PROJECT_DIR$" web="/" />
           </mappings>
           <excludedPaths>
-            <excludedPath path="/home/MAtCha/DropGaussian_release/dataset" />
+            <excludedPath path="/home/DropGaussian_release/dataset" />
           </excludedPaths>
-        </serverdata>
-      </paths>
-      <paths name="root@172.26.14.81:31371 password (2)">
-        <serverdata>
-          <mappings>
-            <mapping deploy="/tmp/pycharm_project_794" local="$PROJECT_DIR$" />
-          </mappings>
-        </serverdata>
-      </paths>
-      <paths name="root@172.26.14.81:31371 password (3)">
-        <serverdata>
-          <mappings>
-            <mapping deploy="/home/MAtCha/DropGaussian_release" local="$PROJECT_DIR$" />
-          </mappings>
-        </serverdata>
-      </paths>
-      <paths name="root@172.26.14.81:31371 password (4)">
-        <serverdata>
-          <mappings>
-            <mapping deploy="/home/MAtCha/DropGaussian_release" local="$PROJECT_DIR$" />
-          </mappings>
         </serverdata>
       </paths>
       <paths name="root@connect.bjb1.seetacloud.com:27902 password (2)">
