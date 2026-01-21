@@ -698,6 +698,7 @@ class GaussianModel:
 
 
 
+
     @torch.no_grad()
     def apply_SaGPD(self, scene, pipe, background,
                     knn_neighbors=8,
