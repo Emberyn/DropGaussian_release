@@ -187,7 +187,10 @@ def readColmapSceneInfo(path, images, eval, n_views=3, llffhold=8):
     if not os.path.exists(ply_path):
         print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
         xyz, rgb, _ = read_points3D_binary(bin_path)
+
+        os.makedirs(os.path.dirname(ply_path), exist_ok=True)
         storePly(ply_path, xyz, rgb)
+
     pcd = fetchPly(ply_path)
 
     reading_dir = "images" if images == None else images
