@@ -696,6 +696,8 @@ class GaussianModel:
         # 累积计数
         self.denom[update_filter] += 1
 
+
+
     @torch.no_grad()
     def apply_SaGPD(self, scene, pipe, background,
                     knn_neighbors=8,
