@@ -820,78 +820,115 @@ class GaussianModel:
         # 渲染完所有深度图后，再次清空CUDA缓存，释放渲染过程中临时占用的显存
         torch.cuda.empty_cache()
 
+        # ===================== 阶段 2: 邻域分析（高效显存版） =====================
+        # 核心目的：只计算密度指标 D_i 和阈值 d_t，不再强行保存庞大的近邻表
+        print("[SaGPD] 分析几何特征 (阶段2: 密度筛选)...")
 
+        # 尝试使用 simple_knn 快速计算密度
+        try:
+            from simple_knn._C import distCUDA2
+            mean_dist_sq, _ = distCUDA2(xyz)
+            D_i = torch.sqrt(mean_dist_sq)
+        except ImportError:
+            # 回退方案：分块计算密度
+            print("[SaGPD] 未找到 simple_knn，使用分块计算密度...")
+            D_i = torch.zeros(N_base, device="cuda")
+            for start in range(0, N_base, 2048):
+                end = min(start + 2048, N_base)
+                # 只计算距离均值，不保存索引，用完即弃
+                dist_batch = torch.cdist(xyz[start:end], xyz)
+                vals, _ = torch.topk(dist_batch, k=knn_neighbors + 1, largest=False)
+                D_i[start:end] = vals[:, 1:].mean(dim=1)
 
-        # ===================== 阶段 2: 邻域分析（筛选稀疏区域） =====================
-        # 核心目的：分析每个点的局部邻域密度，筛选出需要增密的稀疏区域
-        print("[SaGPD] 分析几何特征...")
-        # 计算所有点之间的欧式距离矩阵 (N, N)，dist_matrix[i,j] = 点i到点j的距离
-        dist_matrix = torch.cdist(xyz, xyz)
-        # 对每个点，找到距离最近的 K+1 个点（包含自身），返回距离值和索引
-        # largest=False：按距离从小到大排序，保证取到最近的点
-        dist_k, idx_k = torch.topk(dist_matrix, k=knn_neighbors + 1, largest=False)
-        # 剔除自身（第0个近邻），保留前K个真正的近邻：dist_k (N, K), idx_k (N, K)
-        dist_k, idx_k = dist_k[:, 1:], idx_k[:, 1:]
-        # 计算每个点的平均邻域距离 D_i (N,)：值越大，该点局部区域越稀疏
-        D_i = dist_k.mean(dim=1)
-        # 计算所有点平均邻域距离的中位数 d_t：作为全局密度阈值，区分“密”和“疏”
+        # 计算全局密度阈值
         d_t = torch.median(D_i)
 
-        # 将 D_i 归一化到 [0,1] 区间：消除绝对距离影响，统一稀疏度度量
-        # 1e-12：防止分母为0的数值稳定性处理
+        # 筛选稀疏点
         D_hat = (D_i - D_i.min()) / (D_i.max() - D_i.min() + 1e-12)
-        # 计算稀疏度分位数阈值 tau_s：筛选出稀疏度高于该阈值的点（稀疏区域）
         tau_s = torch.quantile(D_hat, sparsity_threshold)
-        # 获取稀疏区域内所有点的索引（后续仅对这些点生成增密候选）
         sparse_indices = torch.where(D_hat > tau_s)[0]
 
-        # ===================== 阶段 3: 候选点生成（基于平面度过滤） =====================
-        # 核心目的：仅在有效平面区域生成增密候选点，过滤噪声点团的无效增密
-        pre_candidates = []  # 存储初步筛选的候选边（每条边用于生成增密点）
-        # 遍历每个稀疏点，分析其邻域的平面特征
-        for i in sparse_indices:
-            # 获取当前点i的K个近邻的坐标 (K, 3)
-            neighbors_xyz = xyz[idx_k[i]]
-            # 邻域点云中心化：减去邻域中心点坐标，消除平移对协方差计算的影响
-            centered = neighbors_xyz - neighbors_xyz.mean(dim=0)
-            # 计算邻域点云的协方差矩阵 (3, 3)：反映邻域的空间分布特征
-            cov = (centered.T @ centered) / knn_neighbors
-            # 对协方差矩阵进行特征值分解：
-            # u_eig：特征值（从小到大）(3,)，反映邻域在三个正交方向的离散程度
-            # v_eig：特征向量（列向量）(3, 3)，每列对应一个特征值的正交方向
-            u_eig, v_eig = torch.linalg.eigh(cov)
+        # ===================== 阶段 3: 候选点生成（自包含计算版） =====================
+        # 核心修复：在此处即时计算近邻，不再依赖不存在的全局 idx_k
+        print(f"[SaGPD] 正在批量分析几何特征 (需处理稀疏点数: {len(sparse_indices)})...")
+        pre_candidates = []
 
-            # 计算平面度（Planarity Score）：判断邻域是否为有效平面（而非球状噪声）
-            # 公式：1 - (最小特征值 / 平均特征值)
-            # 逻辑：平面区域最小特征值≈0（法向方向离散度低），平面度≈1；噪声点团特征值接近，平面度≈0
-            planarity = 1.0 - (u_eig[0] / (u_eig.mean() + 1e-12))
-            # 过滤条件：平面度<0.8 说明是噪声点团，跳过该点（不生成增密候选）
-            if planarity < 0.8: continue
+        CHUNK_SIZE = 2048  # 批处理大小
 
-            # 提取邻域平面的两个切向基向量（对应较大的两个特征值）：用于新增点的随机偏移
-            u_base, v_base = v_eig[:, 1], v_eig[:, 2]
+        for start in range(0, len(sparse_indices), CHUNK_SIZE):
+            end = min(start + CHUNK_SIZE, len(sparse_indices))
+            batch_indices = sparse_indices[start:end]  # (B,)
 
-            # 遍历当前点i的所有K个近邻，筛选符合条件的长边（稀疏区域的长距离边）
-            for j_idx in range(knn_neighbors):
-                # 获取近邻点j的索引
-                j = idx_k[i, j_idx]
-                # 仅保留 i<j 的边：避免重复处理（i-j和j-i是同一条边）
-                if i < j:
-                    # 获取边i-j的实际长度
-                    L_ij = dist_matrix[i, j].item()
-                    # 筛选长边：长度超过全局密度基准d_t的1.2倍（稀疏区域的长距离边才需要增密）
-                    if L_ij > d_t.item() * 1.2:
-                        # 将符合条件的长边加入候选列表，记录关键信息
-                        pre_candidates.append({
-                            'i': i.item(),  # 边的起点索引
-                            'j': j.item(),  # 边的终点索引
-                            'L': L_ij,  # 边的长度
-                            'u': u_base,  # 邻域平面切向基向量1
-                            'v': v_base  # 邻域平面切向基向量2
-                        })
+            # 获取当前批次稀疏点的坐标
+            batch_xyz = xyz[batch_indices]  # (B, 3)
 
-        # 对候选长边按长度降序排序（优先处理更长的边，即更稀疏的区域），取前 2*budget 个（后续校验会过滤部分）
-        pre_candidates = sorted(pre_candidates, key=lambda x: x['L'], reverse=True)[:budget * 2]
+            # --- 核心修复开始：即时计算当前批次的 KNN ---
+            # 计算 (B, N) 的距离矩阵，而不是 (N, N)，显存安全
+            dist_batch = torch.cdist(batch_xyz, xyz)
+
+            # 获取 TopK 近邻 (B, K+1)
+            # 这里的 batch_idx_k 对应的是全图中的索引
+            batch_dist_k, batch_idx_k = torch.topk(dist_batch, k=knn_neighbors + 1, largest=False)
+
+            # 剔除自身 (第一列)
+            curr_dists = batch_dist_k[:, 1:]  # (B, K) -> 对应之前的 dist_k
+            curr_neighbors_idx = batch_idx_k[:, 1:]  # (B, K) -> 对应之前的 idx_k
+            # --- 核心修复结束 ---
+
+            # 1. 提取邻域坐标进行几何分析 (B, K, 3)
+            # 利用刚刚算出来的索引提取坐标
+            # 注意：idx_k 是全局索引，所以要从全局 xyz 中取
+            neighbors_xyz = xyz[curr_neighbors_idx]
+
+            # 2. 批量计算协方差 (B, 3, 3)
+            centered = neighbors_xyz - neighbors_xyz.mean(dim=1, keepdim=True)
+            covs = torch.matmul(centered.transpose(1, 2), centered) / knn_neighbors
+
+            # 3. 批量特征值分解
+            eigvals, eigvecs = torch.linalg.eigh(covs)
+
+            # 4. 平面度筛选
+            planarities = 1.0 - (eigvals[:, 0] / (eigvals.mean(dim=1) + 1e-12))
+            valid_planarity_mask = planarities > 0.8
+
+            # 5. 提取基向量
+            u_bases = eigvecs[:, :, 1]
+            v_bases = eigvecs[:, :, 2]
+
+            # 6. 处理长边 (在有效平面内)
+            valid_batch_subs = torch.where(valid_planarity_mask)[0]
+
+            for sub_idx in valid_batch_subs:
+                i = batch_indices[sub_idx]  # 全局索引 i
+
+                # 获取当前点的近邻列表 (从即时计算的结果中取)
+                this_neighbors = curr_neighbors_idx[sub_idx]
+                this_dists = curr_dists[sub_idx]
+
+                for k_idx in range(knn_neighbors):
+                    j = this_neighbors[k_idx]  # 全局索引 j
+
+                    # 逻辑保持不变
+                    if i < j:
+                        L_ij = this_dists[k_idx].item()
+                        if L_ij > d_t.item() * 1.2:
+                            pre_candidates.append({
+                                'i': i.item(),
+                                'j': j.item(),
+                                'L': L_ij,
+                                'u': u_bases[sub_idx],
+                                'v': v_bases[sub_idx]
+                            })
+
+        # ===================== 阶段 3.5: 排序与预算 =====================
+        if len(pre_candidates) > 0:
+            pre_candidates = sorted(pre_candidates, key=lambda x: x['L'], reverse=True)
+            pre_candidates = pre_candidates[:budget * 2]
+            print(f"[SaGPD] 几何分析完成。筛选出 {len(pre_candidates)} 条高质量候选边。")
+        else:
+            print("[SaGPD] 未找到符合要求的候选区域。")
+            return
+
 
         # ===================== 阶段 4: 多视图一致性校验（核心鲁棒性保障） =====================
         # 核心目的：校验候选点的深度是否符合多视角物理约束，过滤错误的增密点
