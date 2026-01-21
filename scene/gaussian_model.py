@@ -902,35 +902,43 @@ class GaussianModel:
         p_homo = torch.cat([mu_new, torch.ones(total_points, 1, device="cuda")], dim=-1)
 
         for idx, cam in enumerate(train_cameras):
-            # 5.1 投影判断 (是否在视锥内)
+            # 5.1 投影判断
             p_proj = (p_homo @ cam.full_proj_transform)
             w_proj = p_proj[:, 3]
             ndc_x = p_proj[:, 0] / w_proj
             ndc_y = p_proj[:, 1] / w_proj
-            # 深度 > 0 且 NDC 在 [-1, 1] 内
             mask = (ndc_x >= -1) & (ndc_x <= 1) & (ndc_y >= -1) & (ndc_y <= 1) & (p_proj[:, 2] > 0)
 
             if mask.any():
-                # 5.2 [逻辑修正点] 计算候选点的 View Space Z (线性深度)
-                # 必须与 ref_depths (也是 View Space Z) 对齐，否则减法无物理意义
+                # 5.2 计算预测深度
                 p_view = (p_homo @ cam.world_view_transform)
-                z_new_linear = p_view[:, 2]
+                # 【关键】强制拉平成 1D 向量 (N,)
+                z_new_linear = p_view[:, 2].reshape(-1)
 
                 # 5.3 采样参考深度
                 grid = torch.stack([ndc_x[mask], ndc_y[mask]], dim=-1).unsqueeze(0).unsqueeze(0)
-                curr_depth_map = ref_depths[idx].to("cuda")  # 移回 GPU
+                curr_depth_map = ref_depths[idx].to("cuda")
 
+                # 【关键】使用 reshape(-1) 替代 squeeze()，强制转为 1D 向量 (M,)
                 z_ref = torch.nn.functional.grid_sample(
                     curr_depth_map.unsqueeze(0), grid, align_corners=True, padding_mode="border"
-                ).squeeze()
+                ).reshape(-1)
+
+                # 获取当前视角下有效的预测深度值
+                z_current = z_new_linear[mask].reshape(-1)
 
                 # 5.4 深度误差校验
-                dist_diff = torch.abs(z_new_linear[mask] - z_ref)
+                # 此时 z_current 和 z_ref 都是 (M,)，绝对不会报维度不匹配
+                dist_diff = torch.abs(z_current - z_ref)
                 threshold = z_ref * depth_error + 0.05
-                consistent_mask = dist_diff < threshold
+
+                # 确保比较结果也是 1D 掩码
+                consistent_mask = (dist_diff < threshold).reshape(-1)
 
                 # 5.5 更新通过计数
-                consistency_count[torch.where(mask)[0][consistent_mask]] += 1
+                indices = torch.where(mask)[0]
+                # 确保索引和掩码维度对齐
+                consistency_count[indices[consistent_mask]] += 1
 
         # ===================== 阶段 5: 属性赋值与添加 (全矢量化) =====================
         # 筛选最终有效点
@@ -951,8 +959,9 @@ class GaussianModel:
             # 2. 准备源数据的索引
             idx_i = p_i[final_indices]
             idx_j = p_j[final_indices]
-            w_j = t_r[final_indices].unsqueeze(1)  # 权重 t
-            w_i = 1.0 - w_j  # 权重 1-t
+            # 【核心修复】将权重变为 (515, 1, 1)，这样可以完美适配 (515, 15, 3) 的广播
+            w_j = t_r[final_indices].view(-1, 1, 1)
+            w_i = 1.0 - w_j
 
             # 3. 特征插值 (DC & Rest)
             final_dc = w_i * self._features_dc[idx_i] + w_j * self._features_dc[idx_j]
