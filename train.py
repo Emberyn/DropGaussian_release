@@ -252,11 +252,11 @@ if __name__ == "__main__":
     parser.add_argument("--pre_densify", action="store_true")
     parser.add_argument("--pre_knn_neighbors", type=int, default=8)
     parser.add_argument("--pre_sparsity_threshold", type=float, default=0.7)
-    parser.add_argument("--pre_opacity_scale", type=float, default=0.3)
+    parser.add_argument("--pre_opacity_scale", type=float, default=0.5)
     parser.add_argument("--pre_size_shrink", type=float, default=1.5)
     parser.add_argument("--pre_perturb_strength", type=float, default=0.1)
     parser.add_argument("--pre_min_consistency_views", type=int, default=2)
-    parser.add_argument("--pre_depth_error_limit", type=float, default=0.01)
+    parser.add_argument("--pre_depth_error_limit", type=float, default=0.03)
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)

@@ -696,18 +696,23 @@ class GaussianModel:
         # 累积计数
         self.denom[update_filter] += 1
 
+
+
+
     @torch.no_grad()
     def apply_SaGPD(self, scene, pipe, background,
-                    knn_neighbors=8,
-                    sparsity_threshold=0.7,
-                    opacity_scale=0.3,
-                    size_shrink=1.5,
-                    perturb_strength=0.1,
-                    min_views=2,
-                    depth_error=0.01):
+                    knn_neighbors=8,  # [工程参数] 局部几何分析
+                    sparsity_threshold=0.7,  # [核心参数] 增密范围 (0.5~0.9)
+                    opacity_scale=0.5,  # [工程参数] 透明度衰减
+                    size_shrink=1.5,  # [工程参数] 尺寸收缩
+                    perturb_strength=0.1,  # [工程参数] 扰动强度
+                    min_views=2,  # [核心参数] 最小一致性视角 (硬底线)
+                    depth_error=0.03):  # [核心参数] 几何误差 (0.01~0.05)
         """
-        SaGPD A++ (最终极速版): Surface-aware Gaussian Point Densification
-        优化说明: 全流程矢量化 (Vectorized)，移除 Python 循环，修复坐标系物理定义。
+        SaGPD A++ (最终极速版 + 自适应微调)
+        优化说明:
+        1. 保留所有参数接口，允许手动全权控制。
+        2. 内部增加了对【点数上限】和【视角阈值】的自适应计算，防止在大场景下失效。
         """
         import math
         # 确保 diff_gaussian_rasterization 已正确安装
@@ -721,11 +726,14 @@ class GaussianModel:
         xyz = self.get_xyz
         N_base = xyz.shape[0]
 
-        # ===================== 增密预算控制 =====================
-        MAX_TOTAL_POINTS = 100000
+        # ===================== [自适应修改 1] 增密预算控制 =====================
+        # 原逻辑: MAX_TOTAL_POINTS = 100000 (写死)
+        # 新逻辑: 动态上限，允许当前点数翻倍，且至少给 10 万的额度
+        MAX_TOTAL_POINTS = max(100000, int(N_base * 2.5))
+
         budget = MAX_TOTAL_POINTS - N_base
         if budget <= 0:
-            print("[SaGPD] 当前点数已达上限，跳过增密。")
+            print(f"[SaGPD] 当前点数 ({N_base}) 已达动态上限 ({MAX_TOTAL_POINTS})，跳过。")
             return
 
         # ===================== 阶段 1: 预渲染深度图 (保持物理定义一致) =====================
@@ -822,7 +830,7 @@ class GaussianModel:
             eigvals, eigvecs = torch.linalg.eigh(covs)
 
             planarities = 1.0 - (eigvals[:, 0] / (eigvals.mean(dim=1) + 1e-12))
-            valid_planarity = planarities > 0.8  # (B,)
+            valid_planarity = planarities > 0.6  # [微调] 放宽到 0.6 以适应自然场景
 
             # 3. 矢量化筛选 (构建 Mask)
             # 条件A: 长度 > 阈值
@@ -941,8 +949,12 @@ class GaussianModel:
                 consistency_count[indices[consistent_mask]] += 1
 
         # ===================== 阶段 5: 属性赋值与添加 (全矢量化) =====================
-        # 筛选最终有效点
-        valid_mask = consistency_count >= min_views
+        # [自适应修改 2] 动态计算最小一致性视角
+        # 逻辑: 始终尊重你传入的 min_views (硬底线)，但在多视角下(>20)自动提高要求(10%)，过滤噪声
+        n_cams = len(train_cameras)
+        adaptive_min_views = max(min_views, int(n_cams * 0.1))
+
+        valid_mask = consistency_count >= adaptive_min_views
         valid_indices = torch.where(valid_mask)[0]
 
         # 最终预算截断
@@ -959,7 +971,7 @@ class GaussianModel:
             # 2. 准备源数据的索引
             idx_i = p_i[final_indices]
             idx_j = p_j[final_indices]
-            # 【核心修复】将权重变为 (515, 1, 1)，这样可以完美适配 (515, 15, 3) 的广播
+            # 【核心修复】权重转为 (N, 1, 1) 以适配 (N, 15, 3) 的特征广播
             w_j = t_r[final_indices].view(-1, 1, 1)
             w_i = 1.0 - w_j
 
@@ -985,7 +997,8 @@ class GaussianModel:
             self.densification_postfix(
                 final_xyz, final_dc, final_rest, final_opac, final_scale, final_rot
             )
-            print(f"[SaGPD] 预密集化完成！新增点数: {len(final_xyz)}, 总点数: {self.get_xyz.shape[0]}")
+            print(
+                f"[SaGPD] 预密集化完成 (MinViews={adaptive_min_views})！新增点数: {len(final_xyz)}, 总点数: {self.get_xyz.shape[0]}")
         else:
             print("[SaGPD] 校验完成，没有点通过一致性测试。")
 

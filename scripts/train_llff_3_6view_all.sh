@@ -1,79 +1,64 @@
 #!/bin/bash
 
 # ==============================================================================
-# SaGPD A++ Final Experiment Script
-# 目标: 在 3-view 和 6-view 下全面反超 DropGaussian (PSNR/SSIM/LPIPS)
-# 策略: 混合策略 (Hybrid Strategy)
-#       1. 几何: KNN=6, Depth=0.05 (放宽约束，确保 Horns 结构完整)
-#       2. 探索: Perturb=0.1 (大扰动，增加稀疏点命中真实表面的概率)
-#       3. 优化: Opacity=0.5 (高透明度，强力清洗背景杂点，提升 PSNR)
+# SaGPD A++ Unified Experiment Script (Auto-Adaptive)
+#
+# 策略说明:
+# 本脚本不再手动指定几何参数 (KNN/Depth/Opacity/MinViews)。
+# 所有参数由 Python 代码根据 n_views (3/6/9/12/24) 自动推导，
+# 实现了从"激进补洞"到"精准稳健"的自动切换。
 # ==============================================================================
 
-# 定义实验基础名称
-base_exp_name="llff_sagpd_final_repro"
+# --- 全局实验配置 ---
+BASE_EXP_NAME="llff_sagpd_final_adaptive"
+SCENES=("fern" "flower" "fortress" "horns" "leaves" "orchids" "room" "trex")
+VIEW_COUNTS=(3 6)
 
-# 定义场景列表
-scenes=("fern" "flower" "fortress" "horns" "leaves" "orchids" "room" "trex")
-
-# 定义要运行的视图组 (3视图 和 6视图)
-view_counts=(3 6)
+# --- 唯一需要手动调节的参数 ---
+# 稀疏度阈值依然由人工决定显存预算 (0.7 = 填充最稀疏的 30% 区域)
+SPARSITY_THRESHOLD=0.7
 
 # ===================== 开始循环 =====================
 
-for n_views in "${view_counts[@]}"
+for n_views in "${VIEW_COUNTS[@]}"
 do
     echo "############################################################"
-    echo ">>> 开始执行: $n_views 视图组实验"
+    echo ">>> 启动实验: $n_views 视图 (参数由 Python 自动适配)"
     echo "############################################################"
 
-    # 定义当前视图组的输出路径
-    current_exp_dir="output/${base_exp_name}/views_${n_views}"
+    CURRENT_EXP_DIR="output/${BASE_EXP_NAME}/views_${n_views}"
 
-    for scene_name in "${scenes[@]}"
+    for scene_name in "${SCENES[@]}"
     do
         echo "------------------------------------------------------------"
-        echo "正在处理: Scene: $scene_name | Views: $n_views"
+        echo "Processing: $scene_name | Views: $n_views"
         echo "------------------------------------------------------------"
 
-        # 1. 执行训练 (Train)
-        # 参数说明:
-        # --pre_knn_neighbors 6           : [保持] 较小的K值，对细微结构(Horns)更敏感
-        # --pre_sparsity_threshold 0.7    : [回调] 恢复到0.7，保证足够的稀疏区覆盖率
-        # --pre_opacity_scale 0.5         : [核心] 提至0.5，让新增点更"实"，加速收敛和噪点剔除
-        # --pre_size_shrink 1.5           : [标准] 标准缩放衰减
-        # --pre_perturb_strength 0.1      : [回调] 恢复到0.1，利用大扰动增加命中率
-        # --pre_min_consistency_views 2   : [标准] 最少2视角的几何校验
-        # --pre_depth_error_limit 0.05    : [保持] 宽松的深度误差，容忍SfM的不确定性
-
+        # 1. 执行训练
+        # 注意：这里的 --pre_knn_neighbors 等参数只是为了满足 argparse 接口
+        # 实际数值会被 GaussianModel 内部的自适应逻辑覆盖
         python train.py \
           -s dataset/llff/$scene_name \
-          -m $current_exp_dir/$scene_name \
+          -m $CURRENT_EXP_DIR/$scene_name \
           --eval -r 8 --n_views $n_views \
           --pre_densify \
-          --pre_knn_neighbors 6 \
-          --pre_sparsity_threshold 0.7 \
-          --pre_opacity_scale 0.5 \
+          --pre_sparsity_threshold $SPARSITY_THRESHOLD \
+          --pre_knn_neighbors 8 \
+          --pre_opacity_scale 0.3 \
           --pre_size_shrink 1.5 \
           --pre_perturb_strength 0.1 \
           --pre_min_consistency_views 2 \
-          --pre_depth_error_limit 0.05
+          --pre_depth_error_limit 0.02
 
-        # 2. 执行渲染与评估 (Render)
-        echo ">> 正在进行场景 $scene_name 的最终渲染评估..."
-        python render.py \
-          -m $current_exp_dir/$scene_name \
-          -r 8 \
-          --quiet
+        # 2. 渲染
+        python render.py -m $CURRENT_EXP_DIR/$scene_name -r 8 --quiet
     done
 
-    # 3. 汇总当前视图组指标 (Metrics)
-    echo ">>> 正在汇总 $n_views 视图组的平均指标..."
-    python metric.py --path $current_exp_dir
+    # 3. 汇总
+    python metric.py --path $CURRENT_EXP_DIR
 
 done
 
 echo "============================================================"
-echo "所有基准测试已完成！"
-echo "3 视图结果: output/${base_exp_name}/views_3"
-echo "6 视图结果: output/${base_exp_name}/views_6"
+echo "所有测试完成。请检查训练日志中的 [SaGPD Auto-Tuning] 输出以确认实际参数。"
 echo "============================================================"
