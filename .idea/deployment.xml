@@ -3,7 +3,7 @@
   <component name="PublishConfigData" autoUpload="Always" serverName="root@172.26.14.81:32366 password" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
     <option name="confirmBeforeUploading" value="false" />
     <serverData>
-      <paths name="root@172.26.14.81:32366 password">
+      <paths name="root@172.26.14.81:32366 DropGaussian">
         <serverdata>
           <mappings>
             <mapping deploy="/home/DropGaussian_release" local="$PROJECT_DIR$" web="/" />
@@ -11,6 +11,13 @@
           <excludedPaths>
             <excludedPath path="/home/DropGaussian_release/dataset" />
           </excludedPaths>
+        </serverdata>
+      </paths>
+      <paths name="root@172.26.14.81:32366 Nerf">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
         </serverdata>
       </paths>
       <paths name="root@connect.bjb1.seetacloud.com:27902 password (2)">

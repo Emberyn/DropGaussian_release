@@ -67,7 +67,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-    # --- SaGPD 预密集化执行 ---
+    # --- SaGPD / aGPD-Lite++ 预密集化执行 ---
     if pre_densify_args is not None and pre_densify_args['enabled']:
         try:
             print(f"[SaGPD] 正在执行预密集化校验...")
@@ -84,6 +84,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 depth_error=pre_densify_args['depth_error']
             )
         except Exception as e:
+            # 捕获异常防止中断训练，但打印完整错误栈以便调试
+            import traceback
+            traceback.print_exc()
             print(f"SaGPD 运行出错: {e}")
 
     iter_start = torch.cuda.Event(enable_timing=True)
@@ -248,15 +251,15 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default=None)
 
-    # SaGPD 命令行参数
-    parser.add_argument("--pre_densify", action="store_true")
-    parser.add_argument("--pre_knn_neighbors", type=int, default=8)
-    parser.add_argument("--pre_sparsity_threshold", type=float, default=0.7)
-    parser.add_argument("--pre_opacity_scale", type=float, default=0.5)
-    parser.add_argument("--pre_size_shrink", type=float, default=1.5)
-    parser.add_argument("--pre_perturb_strength", type=float, default=0.1)
-    parser.add_argument("--pre_min_consistency_views", type=int, default=2)
-    parser.add_argument("--pre_depth_error_limit", type=float, default=0.03)
+    # --- SaGPD / aGPD-Lite++ 参数设置 (Updated defaults) ---
+    parser.add_argument("--pre_densify", action="store_true", help="启用 SaGPD 预密集化")
+    parser.add_argument("--pre_knn_neighbors", type=int, default=16, help="KNN邻居数 (论文建议: 16)")
+    parser.add_argument("--pre_sparsity_threshold", type=float, default=0.7, help="稀疏度分位数阈值 (论文建议: 0.7)")
+    parser.add_argument("--pre_opacity_scale", type=float, default=0.3, help="新点不透明度衰减系数 gamma_o (论文建议: 0.3)")
+    parser.add_argument("--pre_size_shrink", type=float, default=1.5, help="新点尺度收缩系数 delta (论文建议: 1.5)")
+    parser.add_argument("--pre_perturb_strength", type=float, default=0.0, help="切平面扰动强度 (Lite++模式下建议设为0)")
+    parser.add_argument("--pre_min_consistency_views", type=int, default=2, help="最少一致性视角数 M (论文建议: 2)")
+    parser.add_argument("--pre_depth_error_limit", type=float, default=0.03, help="Fallback模式下的深度误差限")
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
