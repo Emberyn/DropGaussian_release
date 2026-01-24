@@ -33,7 +33,6 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
 # 尝试导入 Tensorboard
 try:
     from torch.utils.tensorboard import SummaryWriter
-
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
@@ -41,7 +40,6 @@ except ImportError:
 # 全局初始化 LPIPS 评估器
 try:
     from lpips import LPIPS
-
     lpips_fn = LPIPS(net='vgg').cuda()
 except ImportError:
     lpips_fn = None
@@ -68,6 +66,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
     # --- SaGPD / aGPD-Lite++ 预密集化执行 ---
+    # [同步修改] 移除了 perturb_strength 和 depth_error 参数
     if pre_densify_args is not None and pre_densify_args['enabled']:
         try:
             print(f"[SaGPD] 正在执行预密集化校验...")
@@ -79,9 +78,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 sparsity_threshold=pre_densify_args['sparsity_threshold'],
                 opacity_scale=pre_densify_args['opacity_scale'],
                 size_shrink=pre_densify_args['size_shrink'],
-                perturb_strength=pre_densify_args['perturb_strength'],
-                min_views=pre_densify_args['min_views'],
-                depth_error=pre_densify_args['depth_error']
+                min_views=pre_densify_args['min_views']
             )
         except Exception as e:
             # 捕获异常防止中断训练，但打印完整错误栈以便调试
@@ -251,15 +248,14 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default=None)
 
-    # --- SaGPD / aGPD-Lite++ 参数设置 (Updated defaults) ---
+    # --- SaGPD / aGPD-Lite++ 参数设置 (Cleaned) ---
     parser.add_argument("--pre_densify", action="store_true", help="启用 SaGPD 预密集化")
     parser.add_argument("--pre_knn_neighbors", type=int, default=16, help="KNN邻居数 (论文建议: 16)")
     parser.add_argument("--pre_sparsity_threshold", type=float, default=0.7, help="稀疏度分位数阈值 (论文建议: 0.7)")
     parser.add_argument("--pre_opacity_scale", type=float, default=0.3, help="新点不透明度衰减系数 gamma_o (论文建议: 0.3)")
     parser.add_argument("--pre_size_shrink", type=float, default=1.5, help="新点尺度收缩系数 delta (论文建议: 1.5)")
-    parser.add_argument("--pre_perturb_strength", type=float, default=0.0, help="切平面扰动强度 (Lite++模式下建议设为0)")
     parser.add_argument("--pre_min_consistency_views", type=int, default=2, help="最少一致性视角数 M (论文建议: 2)")
-    parser.add_argument("--pre_depth_error_limit", type=float, default=0.03, help="Fallback模式下的深度误差限")
+    # [同步修改] 删除了 --pre_perturb_strength 和 --pre_depth_error_limit 参数定义
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -275,9 +271,8 @@ if __name__ == "__main__":
         'sparsity_threshold': args.pre_sparsity_threshold,
         'opacity_scale': args.pre_opacity_scale,
         'size_shrink': args.pre_size_shrink,
-        'perturb_strength': args.pre_perturb_strength,
         'min_views': args.pre_min_consistency_views,
-        'depth_error': args.pre_depth_error_limit
+        # [同步修改] 字典中移除了 perturb 和 depth_error
     }
 
     # 执行训练并获取最终指标
