@@ -33,6 +33,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
 # 尝试导入 Tensorboard
 try:
     from torch.utils.tensorboard import SummaryWriter
+
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
@@ -40,6 +41,7 @@ except ImportError:
 # 全局初始化 LPIPS 评估器
 try:
     from lpips import LPIPS
+
     lpips_fn = LPIPS(net='vgg').cuda()
 except ImportError:
     lpips_fn = None
@@ -66,7 +68,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
     # --- SaGPD / aGPD-Lite++ 预密集化执行 ---
-    # [同步修改] 移除了 perturb_strength 和 depth_error 参数
+    # [同步修改] 使用字典解包传递所有参数 (包括新增的高级参数)
     if pre_densify_args is not None and pre_densify_args['enabled']:
         try:
             print(f"[SaGPD] 正在执行预密集化校验...")
@@ -74,11 +76,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 scene=scene,
                 pipe=pipe,
                 background=background,
-                knn_neighbors=pre_densify_args['knn_neighbors'],
-                sparsity_threshold=pre_densify_args['sparsity_threshold'],
-                opacity_scale=pre_densify_args['opacity_scale'],
-                size_shrink=pre_densify_args['size_shrink'],
-                min_views=pre_densify_args['min_views']
+                # 使用字典推导式过滤掉 'enabled' 键，其余全部传给函数
+                **{k: v for k, v in pre_densify_args.items() if k != 'enabled'}
             )
         except Exception as e:
             # 捕获异常防止中断训练，但打印完整错误栈以便调试
@@ -248,14 +247,23 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default=None)
 
-    # --- SaGPD / aGPD-Lite++ 参数设置 (Cleaned) ---
+    # --- SaGPD / aGPD-Lite++ 参数设置 (Full Control) ---
     parser.add_argument("--pre_densify", action="store_true", help="启用 SaGPD 预密集化")
-    parser.add_argument("--pre_knn_neighbors", type=int, default=16, help="KNN邻居数 (论文建议: 16)")
-    parser.add_argument("--pre_sparsity_threshold", type=float, default=0.7, help="稀疏度分位数阈值 (论文建议: 0.7)")
-    parser.add_argument("--pre_opacity_scale", type=float, default=0.3, help="新点不透明度衰减系数 gamma_o (论文建议: 0.3)")
-    parser.add_argument("--pre_size_shrink", type=float, default=1.5, help="新点尺度收缩系数 delta (论文建议: 1.5)")
-    parser.add_argument("--pre_min_consistency_views", type=int, default=2, help="最少一致性视角数 M (论文建议: 2)")
-    # [同步修改] 删除了 --pre_perturb_strength 和 --pre_depth_error_limit 参数定义
+    parser.add_argument("--pre_knn_neighbors", type=int, default=16, help="KNN邻居数 K (默认: 16)")
+    parser.add_argument("--pre_sparsity_threshold", type=float, default=0.7, help="稀疏度分位数阈值 tau_s (默认: 0.7)")
+    parser.add_argument("--pre_opacity_scale", type=float, default=0.3, help="不透明度系数 gamma_o (默认: 0.3)")
+    parser.add_argument("--pre_size_shrink", type=float, default=1.5, help="尺寸收缩系数 delta (默认: 1.5)")
+    parser.add_argument("--pre_min_consistency_views", type=int, default=2, help="最小一致性视角 M (默认: 2)")
+
+    # [新增] 高级调参参数 (Advanced Tuning Args) - 同步自 apply_SaGPD
+    parser.add_argument("--pre_dt_quantile", type=float, default=0.6, help="长边判断分位数 dt (默认: 0.6)")
+    parser.add_argument("--pre_len_threshold_mult", type=float, default=2.0, help="边长阈值倍数 (默认: 2.0)")
+    parser.add_argument("--pre_align_ql", type=float, default=0.1, help="DPT对齐下分位 (默认: 0.1)")
+    parser.add_argument("--pre_align_qh", type=float, default=0.9, help="DPT对齐上分位 (默认: 0.9)")
+    parser.add_argument("--pre_eta_o_quantile", type=float, default=0.9, help="动态误差阈值分位数 eta_o (默认: 0.9)")
+    parser.add_argument("--pre_ratio_clamp_min", type=float, default=0.5, help="几何纠偏最小比例 (默认: 0.5)")
+    parser.add_argument("--pre_ratio_clamp_max", type=float, default=2.0, help="几何纠偏最大比例 (默认: 2.0)")
+    parser.add_argument("--pre_visible_count_threshold", type=int, default=50, help="对齐最少可见点数 (默认: 50)")
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -272,7 +280,15 @@ if __name__ == "__main__":
         'opacity_scale': args.pre_opacity_scale,
         'size_shrink': args.pre_size_shrink,
         'min_views': args.pre_min_consistency_views,
-        # [同步修改] 字典中移除了 perturb 和 depth_error
+        # [同步修改] 传递高级参数，对应 gaussian_model.py 中的新接口
+        'dt_quantile': args.pre_dt_quantile,
+        'len_threshold_mult': args.pre_len_threshold_mult,
+        'align_ql': args.pre_align_ql,
+        'align_qh': args.pre_align_qh,
+        'eta_o_quantile': args.pre_eta_o_quantile,
+        'ratio_clamp_min': args.pre_ratio_clamp_min,
+        'ratio_clamp_max': args.pre_ratio_clamp_max,
+        'visible_count_threshold': args.pre_visible_count_threshold
     }
 
     # 执行训练并获取最终指标

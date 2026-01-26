@@ -25,7 +25,7 @@ import cv2
 from tqdm import tqdm
 # 必须确保 diff-gaussian-rasterization 已安装，用于 Fallback 模式
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-
+from sklearn.neighbors import NearestNeighbors
 
 class GaussianModel:
     """
@@ -709,13 +709,27 @@ class GaussianModel:
                     sparsity_threshold=0.7,  # [文档参数] tau_s = Q(D_b, 0.7)，稀疏度分位数阈值
                     min_views=2,  # [文档参数] M=2，通过一致性检查的最小视角数
                     opacity_scale=0.3,  # [文档参数] gamma_o=0.3，不透明度缩放系数
-                    size_shrink=1.5):  # [文档参数] delta=1.5，尺寸收缩系数
+                    size_shrink=1.5,  # [文档参数] delta=1.5，尺寸收缩系数
+                    # --- [新增] 暴露的高级调参接口 ---
+                    dt_quantile=0.6,  # 长边阈值分位数 (原硬编码 0.6 或 0.4)
+                    len_threshold_mult=2.0,  # 边长倍数 (原硬编码 2.0)
+                    align_ql=0.1,  # DPT对齐下分位 (原硬编码 0.1)
+                    align_qh=0.9,  # DPT对齐上分位 (原硬编码 0.9)
+                    eta_o_quantile=0.9,  # 动态误差阈值分位数 (原硬编码 0.9 或 0.7)
+                    ratio_clamp_min=0.5,  # 几何纠偏缩放比例下限 (原硬编码 0.5 或 0.8)
+                    ratio_clamp_max=2.0,  # 几何纠偏缩放比例上限 (原硬编码 2.0 或 1.2)
+                    visible_count_threshold=50  # DPT对齐所需最小点数 (原硬编码 50)
+                    ):
         """
-        [最终验证实现] aGPD-Lite++ 算法
+        [最终验证实现] aGPD-Lite++ 算法 (参数化版本)
         核心功能：基于DPT深度图和可见性约束，对稀疏高斯点云进行预致密化，补充缺失的几何细节
+        现在所有核心参数均已暴露，可通过 train.py 外部控制。
         """
 
-        print(f"\n[aGPD-Lite++] 开始预致密化流程（严格匹配文档版本）...")
+        print(f"\n[aGPD-Lite++] 开始预致密化流程（严格匹配文档版本 - 参数化）...")
+        print(
+            f" > Params: K={knn_neighbors}, Tau={sparsity_threshold}, M={min_views}, Opac={opacity_scale}, Shrink={size_shrink}")
+        print(f" > Advanced: dt_q={dt_quantile}, eta_q={eta_o_quantile}, clamp=[{ratio_clamp_min}, {ratio_clamp_max}]")
         torch.cuda.empty_cache()  # 清理CUDA缓存，避免显存溢出
 
         # 1. 基础数据准备
@@ -809,7 +823,8 @@ class GaussianModel:
             visible_mask = gaussian_vis_mask[:, idx]
 
             # 较难理解，疑惑？-------------------------------------------------
-            if visible_mask.sum() < 50:  # 可见点过少，使用默认对齐参数
+            # [参数化修改] 使用 visible_count_threshold 替换硬编码 50
+            if visible_mask.sum() < visible_count_threshold:  # 可见点过少，使用默认对齐参数
                 alignment_params.append((1.0, 0.0))
                 continue
 
@@ -846,11 +861,11 @@ class GaussianModel:
             if is_neg_corr:
                 d_sample = -d_sample  # 临时翻转，保证后续分位数计算的单调性
 
-            # 步骤5：分位数计算 [对应Algo 2 Line 8] (q_l=0.1, q_h=0.9)
-            q_l, q_h = 0.1, 0.9
+            # 步骤5：分位数计算 [对应Algo 2 Line 8]
+            # [参数化修改] 使用 align_ql, align_qh 替换硬编码 0.1, 0.9
+            q_l, q_h = align_ql, align_qh
             z_l, z_h = torch.quantile(z_gs, q_l), torch.quantile(z_gs, q_h)  # 真实深度的分位数
             d_l, d_h = torch.quantile(d_sample, q_l), torch.quantile(d_sample, q_h)  # 相对深度的分位数
-
 
             # 步骤6：计算对齐参数 a_c (斜率) 和 b_c (截距) [对应Algo 2 Line 9]
             # 较难理解，为什么可以这么处理，或许是一个改进点---------------------
@@ -870,32 +885,47 @@ class GaussianModel:
             alignment_params.append((a_c, b_c))  # 保存该相机的对齐参数
 
 
+            # =================================================================
+            # [Step B] 稀疏触发 (对应Algorithm 2 Part B)
+            # 核心逻辑: 使用 CPU (sklearn) 计算精确的 K 近邻平均距离
+            # 优势: 避免 torch.cdist 的显存爆炸，且比 naive loop 快得多
+            # =================================================================
+            print(f"[Step B] 计算点云稀疏度 (CPU sklearn, K={knn_neighbors})...")
 
+            # 1. 数据转换: CUDA Tensor -> CPU Numpy
+            points_np = xyz.detach().cpu().numpy()
 
-        # =================================================================
-        # [Step B] 稀疏触发 (对应Algorithm 2 Part B)
-        # 核心逻辑: 计算每个高斯点的稀疏度，筛选出需要补充的稀疏点（触发点）
-        # =================================================================
-        print("[Step B] 计算点云稀疏度，筛选触发点...")
+            # 2. 初始化 sklearn KNN
+            # n_neighbors = K + 1 (因为最近的第1个点永远是自己，距离为0，需要排除)
+            # n_jobs = -1 (使用所有 CPU 核心并行计算)
+            nbrs = NearestNeighbors(n_neighbors=knn_neighbors + 1, algorithm='auto', metric='euclidean', n_jobs=-1)
+            nbrs.fit(points_np)
 
-        # 理解：这里有问题，只算3个，但是邻域取16个-------------------------------
-        # 计算每个点到最近邻的平方距离（distCUDA2为CUDA加速的距离计算函数）
-        dist2, _ = distCUDA2(xyz)  # 1. 得到每个点的「最近三个点的平方距离的平均数」
-        dist = torch.sqrt(dist2).squeeze()  # 2. 开根号→真实欧式距离；squeeze去除冗余维度
+            # 3. 查询 K 个最近邻
+            # distances shape: (N, K+1)
+            distances, _ = nbrs.kneighbors(points_np)
 
-        # 较难理解，这里是不是有问题？-----------------------------
-        # 将稀疏度归一化到[0,1]（D_bi），消除绝对距离的影响
-        d_min, d_max = dist.min(), dist.max()
-        d_bi = (dist - d_min) / (d_max - d_min + 1e-8)
+            # 4. 计算平均距离
+            # 去掉第一列（自己到自己的距离 0），保留剩下的 K 列
+            neighbor_dists = distances[:, 1:]
+            # 计算行均值 (N,)
+            mean_dists = neighbor_dists.mean(axis=1)
 
-        # 计算稀疏度阈值 tau_s = Q(D_b, 0.7) [对应Algo 2 Part B]
-        # 取70%分位数作为阈值，大于该值的点判定为稀疏点
-        tau_s = torch.quantile(d_bi, sparsity_threshold)
-        # 筛选出稀疏触发点的索引
-        trigger_indices = torch.where(d_bi > tau_s)[0]
+            # 5. 数据转换: Numpy -> CUDA Tensor
+            dist = torch.from_numpy(mean_dists).float().to(xyz.device)
 
-        if len(trigger_indices) == 0:  # 无稀疏点，直接返回
-            return
+            # 6. 归一化稀疏度 (保持原有逻辑)
+            d_min, d_max = dist.min(), dist.max()
+            d_bi = (dist - d_min) / (d_max - d_min + 1e-8)
+
+            # 7. 计算阈值并筛选
+            # tau_s = Q(D_b, sparsity_threshold)
+            tau_s = torch.quantile(d_bi, sparsity_threshold)
+            trigger_indices = torch.where(d_bi > tau_s)[0]
+
+            if len(trigger_indices) == 0:
+                return
+
 
         # =================================================================
         # [Step C] 候选点生成 (对应Algorithm 2 Part C)
@@ -909,8 +939,10 @@ class GaussianModel:
 
         # 较难理解，为什么是2倍的60%
         # 计算长度阈值：2倍的60%分位数距离（过滤过短的边）
-        dt = torch.quantile(dist, 0.4)
-        len_threshold = 2.0 * dt
+        # [参数化修改] 使用 dt_quantile 替换硬编码
+        dt = torch.quantile(dist, dt_quantile)
+        # [参数化修改] 使用 len_threshold_mult 替换硬编码 2.0
+        len_threshold = len_threshold_mult * dt
         chunk_size = 4096  # 分块处理，避免显存溢出
 
         # 分块处理触发点（防止一次性处理过多点导致CUDA OOM）
@@ -969,15 +1001,12 @@ class GaussianModel:
         if not candidates_mu:  # 无有效候选点，直接返回
             return
 
-
         # 合并所有候选点数据
         cand_mu_cat = torch.cat(candidates_mu)  # 候选点坐标 (N_cand, 3)
         cand_i_cat = torch.cat(candidates_i)  # 对应触发点索引 (N_cand,)
         cand_j_cat = torch.cat(candidates_j)  # 对应邻居点索引 (N_cand,)
         N_cand = cand_mu_cat.shape[0]
         print(f" > 生成 {N_cand} 个候选点.")
-
-
 
         # =================================================================
         # [Step D] 动态分位数阈值与过滤 (对应Algorithm 2 Part D)
@@ -1015,7 +1044,7 @@ class GaussianModel:
                 continue
 
             # 理解：比较关键的变量，当前视角下的所有可见的候选点的索引
-            valid_indices = torch.where(in_view)[0] # 返回的是一列索引中的部分索引
+            valid_indices = torch.where(in_view)[0]  # 返回的是一列索引中的部分索引
 
             # 记录有效视角数（分母 |C_check|）
             valid_view_counts[valid_indices] += 1
@@ -1025,7 +1054,7 @@ class GaussianModel:
             grid = ndc[valid_indices].unsqueeze(0).unsqueeze(0)
             # 采样DPT相对深度
             d_raw = torch.nn.functional.grid_sample(
-                dpt_depth_maps[idx].unsqueeze(0).unsqueeze(0),    # (1, 1, H, W)
+                dpt_depth_maps[idx].unsqueeze(0).unsqueeze(0),  # (1, 1, H, W)
                 grid, align_corners=True, padding_mode="border"
             ).squeeze()
             # 得到（M,）
@@ -1058,7 +1087,6 @@ class GaussianModel:
             # 更新这些点的最佳参考深度为当前视角采样得到的z_ref
             best_z_ref[update_idx] = z_ref[better]
 
-
         # Phase 2: 计算动态阈值 eta_o [对应Eq.7]
         # eta_o = Q(Error_set, 0.9)：所有有效误差的90%分位数
         valid_mask_global = ~torch.isnan(error_matrix)  # 有效误差掩码，二维
@@ -1067,10 +1095,11 @@ class GaussianModel:
         if len(all_valid_errors) == 0:  # 无有效误差，直接返回
             return
 
-        eta_o = torch.quantile(all_valid_errors, 0.7)
+        # [参数化修改] 使用 eta_o_quantile 替换硬编码 0.9
+        eta_o = torch.quantile(all_valid_errors, eta_o_quantile)
         # 最小值保护：避免阈值过小导致除零（工程鲁棒性）
         eta_o = torch.maximum(eta_o, torch.tensor(1e-8, device="cuda"))
-        print(f" > 动态误差阈值 (eta_o): {eta_o:.4f}")
+        print(f" > 动态误差阈值 (eta_o, q={eta_o_quantile}): {eta_o:.4f}")
 
         # Phase 3: 应用阈值过滤 [对应Algo 2 Line D.7]
         # 仅保留误差小于eta_o的视角
@@ -1120,9 +1149,9 @@ class GaussianModel:
         # 核心公式：new_xyz = cam_center + (raw_xyz - cam_center) * (target_z / current_z)
         # 理解，怎么算的？这里的工程约束真的可靠吗？-------------------------------------------------------
         ratio = target_z / (current_z + 1e-8)  # 深度缩放比例
-        ratio = torch.clamp(ratio, 0.8, 1.2)  # 工程约束：缩放比例限制在[0.5,2.0]，避免过度纠偏
+        # [参数化修改] 使用 ratio_clamp_min, ratio_clamp_max 替换硬编码
+        ratio = torch.clamp(ratio, ratio_clamp_min, ratio_clamp_max)  # 工程约束：避免过度纠偏
         final_xyz = centers + (final_xyz_raw - centers) * ratio.unsqueeze(1)  # 纠偏后的最终坐标
-
 
         # =================================================================
         # [Step F] 可信度门控初始化 (对应Algorithm 2 Part F)
@@ -1133,7 +1162,6 @@ class GaussianModel:
         f_dc = 0.5 * (self._features_dc[idx_i_final] + self._features_dc[idx_j_final])  # 直流特征
         f_rest = 0.5 * (self._features_rest[idx_i_final] + self._features_rest[idx_j_final])  # 高频特征
         rot = self._rotation[idx_i_final]  # 旋转参数（继承触发点）
-
 
         # Term 1: 通过率 Ratio [对应Algo 2 Line F.1 Part 1]
         # cnt / |C_check|，限制在[0,1]（避免分母为0，取最大值1）
