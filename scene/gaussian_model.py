@@ -926,87 +926,96 @@ class GaussianModel:
             if len(trigger_indices) == 0:
                 return
 
+            # =================================================================
+            # [Step C] 候选点生成 (对应Algorithm 2 Part C)
+            # 逻辑策略: "广撒网，后收敛"
+            # 1. 循环内: 每个点只管找自己的最远邻居，先把索引记下来 (不做去重)。
+            # 2. 循环外: 对收集到的所有边进行排序和 unique，统一去除双向重复。
+            # =================================================================
+            print("[Step C] 基于VOV约束生成候选点 (收集阶段)...")
 
-        # =================================================================
-        # [Step C] 候选点生成 (对应Algorithm 2 Part C)
-        # 核心逻辑: 对每个触发点，基于KNN和可见交集约束生成候选点（中点插值）
-        # 约束：1. 邻居与触发点有共同可见相机 |Vi ∩ Vu| >=1；2. 边长远大于局部均值
-        # =================================================================
-        print("[Step C] 基于VOV约束生成候选点...")
-        candidates_mu = []  # 存储候选点的3D坐标
-        candidates_i = []  # 存储候选点对应的触发点索引
-        candidates_j = []  # 存储候选点对应的邻居点索引
+            # 临时列表只存储索引 (int64)，不存坐标 (省显存)
+            raw_edge_u = []  # 起点
+            raw_edge_v = []  # 终点
 
-        # 较难理解，为什么是2倍的60%
-        # 计算长度阈值：2倍的60%分位数距离（过滤过短的边）
-        # [参数化修改] 使用 dt_quantile 替换硬编码
-        dt = torch.quantile(dist, dt_quantile)
-        # [参数化修改] 使用 len_threshold_mult 替换硬编码 2.0
-        len_threshold = len_threshold_mult * dt
-        chunk_size = 4096  # 分块处理，避免显存溢出
+            # 计算长度阈值 (基于 Step B 算出的全局 dist)
+            dt = torch.quantile(dist, dt_quantile)
+            len_threshold = len_threshold_mult * dt
+            chunk_size = 4096
 
-        # 分块处理触发点（防止一次性处理过多点导致CUDA OOM）
-        for k in range(0, len(trigger_indices), chunk_size):
-            batch_idx = trigger_indices[k: k + chunk_size]  # 当前块的触发点索引
-            batch_xyz = xyz[batch_idx]  # 当前块的触发点坐标
+            # 分块处理触发点
+            for k in range(0, len(trigger_indices), chunk_size):
+                batch_idx = trigger_indices[k: k + chunk_size]
+                batch_xyz = xyz[batch_idx]
 
-            # 理解：这里才是正常的实现？--------------------------------------------------------
-            # KNN查找：每个触发点找knn_neighbors个最近邻（排除自身）[对应Algo 2 Line C.1]
-            dists_k, idxs_k = torch.cdist(batch_xyz, xyz).topk(knn_neighbors + 1, largest=False)
-            local_dists, local_idxs = dists_k[:, 1:], idxs_k[:, 1:]  # 排除自身（第0个是自己）
+                # 1. KNN 搜索 (K=16, 此时用 torch.cdist 计算局部距离矩阵)
+                # 注意: 这里的 batch_xyz 较小，cdist 不会爆显存
+                dists_k, idxs_k = torch.cdist(batch_xyz, xyz).topk(knn_neighbors + 1, largest=False)
+                local_dists, local_idxs = dists_k[:, 1:], idxs_k[:, 1:]
 
-            # VOV检查：触发点与邻居是否有共同可见的相机 |Vi ∩ Vu| >=1 [对应Algo 2 Line C.3]
-            vis_center = gaussian_vis_mask[batch_idx]  # 触发点的可见性掩码 (B, N_cams)
-            vis_neighbors = gaussian_vis_mask[local_idxs]  # 邻居的可见性掩码 (B, K, N_cams)
-            # 逐邻居检查是否有共同可见相机（任意相机同时可见）
-            has_overlap = (vis_center.unsqueeze(1) & vis_neighbors).any(dim=-1)  # (B, K)
+                # 2. VOV 可见性检查
+                vis_center = gaussian_vis_mask[batch_idx]
+                vis_neighbors = gaussian_vis_mask[local_idxs]
+                has_overlap = (vis_center.unsqueeze(1) & vis_neighbors).any(dim=-1)
 
-            # 策略：优先选择有可见交集的邻居 (B,K)
-            masked_dists_vov = local_dists.clone()
-            # 在第1维过滤，第1维指的是每个邻居点，无交集的邻居标记为无效（距离=-1）
-            masked_dists_vov[~has_overlap] = -1.0
-            #  举例：
-            # masked_dists_vov = torch.tensor([[0.1, 0.2, 0.3],
-            #                                  [0.4, 0.5, 0.6]])
-            # has_overlap = torch.tensor([[True, False, True],
-            #                             [False, True, False]])
+                # 3. 策略：优先选择有交集的邻居
+                masked_dists_vov = local_dists.clone()
+                masked_dists_vov[~has_overlap] = -1.0
+                max_d_vov, arg_vov = masked_dists_vov.max(dim=1)
 
-            # 找有交集的邻居中距离最远的（最大化候选点覆盖范围）
-            max_d_vov, arg_vov = masked_dists_vov.max(dim=1)
+                # 4. 降级策略 (Fallback)
+                max_d_raw, arg_raw = local_dists.max(dim=1)
+                use_raw = (max_d_vov < 0)
+                final_arg = torch.where(use_raw, arg_raw, arg_vov)
+                final_max_d = torch.where(use_raw, max_d_raw, max_d_vov)
 
-            # 较难理解，可以这么做吗？--------------------------------------------------
-            # 降级策略：若所有邻居都无交集，选择原始最远邻居 [对应Algo 2 Line C.5]
-            # 返回的都是一维张量，触发点：触发点到邻居点的最大距离(和该邻居点的索引)
-            max_d_raw, arg_raw = local_dists.max(dim=1)
-            use_raw = (max_d_vov < 0)  # 标记需要降级的触发点
-            # 最终选择的邻居索引
-            # torch.where(条件张量, 真值取值张量, 假值取值张量)
-            final_arg = torch.where(use_raw, arg_raw, arg_vov)
-            final_max_d = torch.where(use_raw, max_d_raw, max_d_vov)
+                # 5. 长度筛选
+                valid = final_max_d > len_threshold
 
-            # 长度筛选：仅保留边长远于阈值的候选 [对应Algo 2 Line C.6]
-            valid = final_max_d > len_threshold
+                if valid.any():
+                    # 获取当前批次中满足条件的 起点 u
+                    u_indices = batch_idx[valid]
+                    # 获取对应的 终点 v (从局部索引映射回全局索引)
+                    v_indices = local_idxs[valid].gather(1, final_arg[valid].unsqueeze(1)).squeeze()
 
-            if valid.any():
-                # 筛选出有效触发点索引
-                v_batch_idx = batch_idx[valid]
-                # 理解：找到对应邻居的全局索引，语法较难
-                v_target_global = local_idxs[valid].gather(1, final_arg[valid].unsqueeze(1)).squeeze()
+                    # [关键] 直接记录，不做任何去重判断
+                    raw_edge_u.append(u_indices)
+                    raw_edge_v.append(v_indices)
 
-                # 中点插值生成候选点 [对应Algo 2 Line C.7]
-                candidates_mu.append(0.5 * (xyz[v_batch_idx] + xyz[v_target_global]))
-                candidates_i.append(v_batch_idx)
-                candidates_j.append(v_target_global)
+            # 如果没有收集到任何边，直接返回
+            if not raw_edge_u:
+                print(" > 未找到满足条件的候选边.")
+                return
 
-        if not candidates_mu:  # 无有效候选点，直接返回
-            return
+            # =================================================================
+            # [Step C.5] 全局去重 (Global Deduplication)
+            # =================================================================
+            print(" > 执行全局双向边去重...")
 
-        # 合并所有候选点数据
-        cand_mu_cat = torch.cat(candidates_mu)  # 候选点坐标 (N_cand, 3)
-        cand_i_cat = torch.cat(candidates_i)  # 对应触发点索引 (N_cand,)
-        cand_j_cat = torch.cat(candidates_j)  # 对应邻居点索引 (N_cand,)
-        N_cand = cand_mu_cat.shape[0]
-        print(f" > 生成 {N_cand} 个候选点.")
+            # 1. 合并所有批次的索引
+            all_u = torch.cat(raw_edge_u)
+            all_v = torch.cat(raw_edge_v)
+
+            # 2. 标准化边方向: (u, v) -> (min(u,v), max(u,v))
+            # 这样 (A, B) 和 (B, A) 都会变成同一种形式
+            edges = torch.stack([all_u, all_v], dim=1)  # Shape: (N, 2)
+            edges_sorted, _ = torch.sort(edges, dim=1)  # 行内排序
+
+            # 3. 唯一化: 去除重复行
+            unique_edges = torch.unique(edges_sorted, dim=0)
+
+            # 4. 提取去重后的索引
+            cand_i_cat = unique_edges[:, 0]
+            cand_j_cat = unique_edges[:, 1]
+
+            # 5. 此时才计算中点坐标 (避免了对重复点计算坐标的开销)
+            cand_mu_cat = 0.5 * (xyz[cand_i_cat] + xyz[cand_j_cat])
+
+            N_cand = cand_mu_cat.shape[0]
+            print(f" > 最终生成 {N_cand} 个候选点 (去重后).")
+
+
+
 
         # =================================================================
         # [Step D] 动态分位数阈值与过滤 (对应Algorithm 2 Part D)
