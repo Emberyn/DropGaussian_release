@@ -25,7 +25,7 @@ do
       -m output/$exp_name/$scene_name \
       --eval -r 8 --n_views 6 \
       --pre_densify \
-      --pre_knn_neighbors 16 \
+      --pre_knn_neighbors 3 \
       --pre_sparsity_threshold 0.7 \
       --pre_opacity_scale 0.3 \
       --pre_size_shrink 1.5 \

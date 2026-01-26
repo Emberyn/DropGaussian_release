@@ -847,7 +847,7 @@ class GaussianModel:
                 d_sample = -d_sample  # 临时翻转，保证后续分位数计算的单调性
 
             # 步骤5：分位数计算 [对应Algo 2 Line 8] (q_l=0.1, q_h=0.9)
-            q_l, q_h = 0.25, 0.75
+            q_l, q_h = 0.1, 0.9
             z_l, z_h = torch.quantile(z_gs, q_l), torch.quantile(z_gs, q_h)  # 真实深度的分位数
             d_l, d_h = torch.quantile(d_sample, q_l), torch.quantile(d_sample, q_h)  # 相对深度的分位数
 
@@ -907,8 +907,9 @@ class GaussianModel:
         candidates_i = []  # 存储候选点对应的触发点索引
         candidates_j = []  # 存储候选点对应的邻居点索引
 
+        # 较难理解，为什么是2倍的60%
         # 计算长度阈值：2倍的60%分位数距离（过滤过短的边）
-        dt = torch.quantile(dist, 0.6)
+        dt = torch.quantile(dist, 0.4)
         len_threshold = 2.0 * dt
         chunk_size = 4096  # 分块处理，避免显存溢出
 
@@ -917,6 +918,7 @@ class GaussianModel:
             batch_idx = trigger_indices[k: k + chunk_size]  # 当前块的触发点索引
             batch_xyz = xyz[batch_idx]  # 当前块的触发点坐标
 
+            # 理解：这里才是正常的实现？--------------------------------------------------------
             # KNN查找：每个触发点找knn_neighbors个最近邻（排除自身）[对应Algo 2 Line C.1]
             dists_k, idxs_k = torch.cdist(batch_xyz, xyz).topk(knn_neighbors + 1, largest=False)
             local_dists, local_idxs = dists_k[:, 1:], idxs_k[:, 1:]  # 排除自身（第0个是自己）
@@ -927,17 +929,26 @@ class GaussianModel:
             # 逐邻居检查是否有共同可见相机（任意相机同时可见）
             has_overlap = (vis_center.unsqueeze(1) & vis_neighbors).any(dim=-1)  # (B, K)
 
-            # 策略：优先选择有可见交集的邻居 [对应Algo 2 Line C.4]
+            # 策略：优先选择有可见交集的邻居 (B,K)
             masked_dists_vov = local_dists.clone()
-            masked_dists_vov[~has_overlap] = -1.0  # 无交集的邻居标记为无效（距离=-1）
+            # 在第1维过滤，第1维指的是每个邻居点，无交集的邻居标记为无效（距离=-1）
+            masked_dists_vov[~has_overlap] = -1.0
+            #  举例：
+            # masked_dists_vov = torch.tensor([[0.1, 0.2, 0.3],
+            #                                  [0.4, 0.5, 0.6]])
+            # has_overlap = torch.tensor([[True, False, True],
+            #                             [False, True, False]])
 
             # 找有交集的邻居中距离最远的（最大化候选点覆盖范围）
             max_d_vov, arg_vov = masked_dists_vov.max(dim=1)
 
+            # 较难理解，可以这么做吗？--------------------------------------------------
             # 降级策略：若所有邻居都无交集，选择原始最远邻居 [对应Algo 2 Line C.5]
+            # 返回的都是一维张量，触发点：触发点到邻居点的最大距离(和该邻居点的索引)
             max_d_raw, arg_raw = local_dists.max(dim=1)
             use_raw = (max_d_vov < 0)  # 标记需要降级的触发点
             # 最终选择的邻居索引
+            # torch.where(条件张量, 真值取值张量, 假值取值张量)
             final_arg = torch.where(use_raw, arg_raw, arg_vov)
             final_max_d = torch.where(use_raw, max_d_raw, max_d_vov)
 
@@ -947,7 +958,7 @@ class GaussianModel:
             if valid.any():
                 # 筛选出有效触发点索引
                 v_batch_idx = batch_idx[valid]
-                # 找到对应邻居的全局索引
+                # 理解：找到对应邻居的全局索引，语法较难
                 v_target_global = local_idxs[valid].gather(1, final_arg[valid].unsqueeze(1)).squeeze()
 
                 # 中点插值生成候选点 [对应Algo 2 Line C.7]
@@ -957,12 +968,16 @@ class GaussianModel:
 
         if not candidates_mu:  # 无有效候选点，直接返回
             return
+
+
         # 合并所有候选点数据
         cand_mu_cat = torch.cat(candidates_mu)  # 候选点坐标 (N_cand, 3)
         cand_i_cat = torch.cat(candidates_i)  # 对应触发点索引 (N_cand,)
         cand_j_cat = torch.cat(candidates_j)  # 对应邻居点索引 (N_cand,)
         N_cand = cand_mu_cat.shape[0]
         print(f" > 生成 {N_cand} 个候选点.")
+
+
 
         # =================================================================
         # [Step D] 动态分位数阈值与过滤 (对应Algorithm 2 Part D)
@@ -981,6 +996,7 @@ class GaussianModel:
 
         # 临时误差矩阵 (N_cand, N_cams)，存储每个候选点在每个相机的深度误差（nan表示无效）
         error_matrix = torch.full((N_cand, N_cams), float('nan'), device="cuda")
+
         # 候选点转换为齐次坐标，方便投影计算
         cand_homo = torch.cat([cand_mu_cat, torch.ones(N_cand, 1, device="cuda")], dim=-1)
 
@@ -997,18 +1013,22 @@ class GaussianModel:
 
             if not in_view.any():  # 该相机无有效候选点，跳过
                 continue
-            valid_indices = torch.where(in_view)[0]
+
+            # 理解：比较关键的变量，当前视角下的所有可见的候选点的索引
+            valid_indices = torch.where(in_view)[0] # 返回的是一列索引中的部分索引
 
             # 记录有效视角数（分母 |C_check|）
             valid_view_counts[valid_indices] += 1
 
             # 步骤2：从DPT深度图采样并对齐，得到目标深度z_ref [对应Algo 2 Line A.10]
+            #  (1, 1, M, 2)
             grid = ndc[valid_indices].unsqueeze(0).unsqueeze(0)
             # 采样DPT相对深度
             d_raw = torch.nn.functional.grid_sample(
-                dpt_depth_maps[idx].unsqueeze(0).unsqueeze(0),
+                dpt_depth_maps[idx].unsqueeze(0).unsqueeze(0),    # (1, 1, H, W)
                 grid, align_corners=True, padding_mode="border"
             ).squeeze()
+            # 得到（M,）
 
             # 应用对齐参数，将相对深度转换为度量深度 z_ref (z_render)
             a_c, b_c = alignment_params[idx]
@@ -1019,27 +1039,35 @@ class GaussianModel:
             z_metric = p_view[:, 2]
 
             # 步骤4：计算深度误差 e = |z_metric - z_ref| [对应Algo 2 Line D.6]
+            # diff只存储「当前视角有效点」的误差，索引范围是0~M - 1（局部索引），M是当前视角下的有效点数量
             diff = torch.abs(z_metric - z_ref)
 
-            # 存入误差矩阵
+            # 存入误差矩阵,一列
             error_matrix[valid_indices, idx] = diff
 
-            # 更新最佳视角：选择误差最小的视角（用于后续几何纠偏）[对应Algo 2 Line E.1]
+            # 更新最佳视角：选择误差最小的视角（用于后续几何纠偏）
+            # better：布尔掩码 (M,)，标记当前视角误差是否小于该点已记录的最小视角误差（True=当前视角更优）
             better = diff < min_view_error[valid_indices]
+            # update_idx：提取需要更新的有效点全局索引（筛选出当前视角更优的点）
             update_idx = valid_indices[better]
+            # 更新这些点的最小视角误差为当前视角的误差值
+            # 一维，N_rand
             min_view_error[update_idx] = diff[better]
+            # 记录这些点的最佳视角索引为当前处理的视角idx
             best_view_idx[update_idx] = idx
+            # 更新这些点的最佳参考深度为当前视角采样得到的z_ref
             best_z_ref[update_idx] = z_ref[better]
+
 
         # Phase 2: 计算动态阈值 eta_o [对应Eq.7]
         # eta_o = Q(Error_set, 0.9)：所有有效误差的90%分位数
-        valid_mask_global = ~torch.isnan(error_matrix)  # 有效误差掩码
-        all_valid_errors = error_matrix[valid_mask_global]  # 所有有效误差值
+        valid_mask_global = ~torch.isnan(error_matrix)  # 有效误差掩码，二维
+        all_valid_errors = error_matrix[valid_mask_global]  # 所有有效误差值，一维
 
         if len(all_valid_errors) == 0:  # 无有效误差，直接返回
             return
 
-        eta_o = torch.quantile(all_valid_errors, 0.9)
+        eta_o = torch.quantile(all_valid_errors, 0.7)
         # 最小值保护：避免阈值过小导致除零（工程鲁棒性）
         eta_o = torch.maximum(eta_o, torch.tensor(1e-8, device="cuda"))
         print(f" > 动态误差阈值 (eta_o): {eta_o:.4f}")
@@ -1053,6 +1081,7 @@ class GaussianModel:
         # 最终筛选：通过视角数 >= min_views [对应Algo 2 Line D.8]
         final_mask = pass_counts >= min_views
         # 同时过滤掉无最佳视角的候选点
+        # 理解：有了通过视角数不就有了最佳视角吗？为什么还要特地判断？
         final_idx = torch.where(final_mask & (best_view_idx != -1))[0]
 
         if len(final_idx) == 0:
@@ -1089,9 +1118,11 @@ class GaussianModel:
 
         # 深度回投影纠偏 [对应Algo 2 Line E.3]
         # 核心公式：new_xyz = cam_center + (raw_xyz - cam_center) * (target_z / current_z)
+        # 理解，怎么算的？这里的工程约束真的可靠吗？-------------------------------------------------------
         ratio = target_z / (current_z + 1e-8)  # 深度缩放比例
-        ratio = torch.clamp(ratio, 0.5, 2.0)  # 工程约束：缩放比例限制在[0.5,2.0]，避免过度纠偏
+        ratio = torch.clamp(ratio, 0.8, 1.2)  # 工程约束：缩放比例限制在[0.5,2.0]，避免过度纠偏
         final_xyz = centers + (final_xyz_raw - centers) * ratio.unsqueeze(1)  # 纠偏后的最终坐标
+
 
         # =================================================================
         # [Step F] 可信度门控初始化 (对应Algorithm 2 Part F)
@@ -1103,8 +1134,10 @@ class GaussianModel:
         f_rest = 0.5 * (self._features_rest[idx_i_final] + self._features_rest[idx_j_final])  # 高频特征
         rot = self._rotation[idx_i_final]  # 旋转参数（继承触发点）
 
+
         # Term 1: 通过率 Ratio [对应Algo 2 Line F.1 Part 1]
         # cnt / |C_check|，限制在[0,1]（避免分母为0，取最大值1）
+        # valid_view_counts[final_idx]这些候选点的有效视角数量（候选点在所在的视角的视锥内则称该视角为该候选点的有效视角）
         denom = torch.maximum(valid_view_counts[final_idx], torch.tensor(1, device="cuda"))
         term_ratio = torch.clamp(pass_counts[final_idx].float() / denom.float(), 0.0, 1.0)
 
