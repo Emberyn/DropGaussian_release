@@ -849,6 +849,7 @@ class GaussianModel:
                 grid, align_corners=True, padding_mode="border"  # 边界填充避免越界
             ).squeeze()  # 输出采样深度 (N_valid,)
 
+
             # 较难理解---------------------------------------------------
             # 步骤4：相关性检查 [对应Algo 2 Line 6-7]
             # 逻辑：若真实深度z_gs与相对深度d_sample负相关，则翻转d_sample
@@ -887,130 +888,114 @@ class GaussianModel:
 
             # =================================================================
             # [Step B] 稀疏触发 (对应Algorithm 2 Part B)
-            # 核心逻辑: 使用 CPU (sklearn) 计算精确的 K 近邻平均距离
-            # 优势: 避免 torch.cdist 的显存爆炸，且比 naive loop 快得多
+            # 核心逻辑: 使用 sklearn 计算精确的 K 近邻 (距离+索引)，供 Step C 复用
             # =================================================================
             print(f"[Step B] 计算点云稀疏度 (CPU sklearn, K={knn_neighbors})...")
 
             # 1. 数据转换: CUDA Tensor -> CPU Numpy
             points_np = xyz.detach().cpu().numpy()
 
-            # 2. 初始化 sklearn KNN
-            # n_neighbors = K + 1 (因为最近的第1个点永远是自己，距离为0，需要排除)
-            # n_jobs = -1 (使用所有 CPU 核心并行计算)
+            # 2. 全局 KNN 搜索 (CPU 并行)
+            # n_neighbors = K + 1 (排除自身)
             nbrs = NearestNeighbors(n_neighbors=knn_neighbors + 1, algorithm='auto', metric='euclidean', n_jobs=-1)
             nbrs.fit(points_np)
 
-            # 3. 查询 K 个最近邻
-            # distances shape: (N, K+1)
-            distances, _ = nbrs.kneighbors(points_np)
+            # 获取所有点的距离和索引 (供 Step C 复用)
+            dists_all, indices_all = nbrs.kneighbors(points_np)
 
-            # 4. 计算平均距离
-            # 去掉第一列（自己到自己的距离 0），保留剩下的 K 列
-            neighbor_dists = distances[:, 1:]
-            # 计算行均值 (N,)
-            mean_dists = neighbor_dists.mean(axis=1)
+            # 3. 提取有效邻居 (去掉第0列自身)
+            neighbor_dists_cpu = dists_all[:, 1:]  # (N, K)
+            neighbor_indices_cpu = indices_all[:, 1:]  # (N, K)
 
-            # 5. 数据转换: Numpy -> CUDA Tensor
+            # 4. 计算局部平均距离 (用于稀疏度判定)
+            mean_dists = neighbor_dists_cpu.mean(axis=1)
             dist = torch.from_numpy(mean_dists).float().to(xyz.device)
 
-            # 6. 归一化稀疏度 (保持原有逻辑)
+            # 5. 计算稀疏度阈值并筛选触发点 (保持原有逻辑)
             d_min, d_max = dist.min(), dist.max()
             d_bi = (dist - d_min) / (d_max - d_min + 1e-8)
-
-            # 7. 计算阈值并筛选
-            # tau_s = Q(D_b, sparsity_threshold)
             tau_s = torch.quantile(d_bi, sparsity_threshold)
-            trigger_indices = torch.where(d_bi > tau_s)[0]
 
-            if len(trigger_indices) == 0:
-                return
+            trigger_indices = torch.where(d_bi > tau_s)[0]
+            if len(trigger_indices) == 0: return
 
             # =================================================================
             # [Step C] 候选点生成 (对应Algorithm 2 Part C)
-            # 逻辑策略: "广撒网，后收敛"
-            # 1. 循环内: 每个点只管找自己的最远邻居，先把索引记下来 (不做去重)。
-            # 2. 循环外: 对收集到的所有边进行排序和 unique，统一去除双向重复。
+            # 优化策略: "广撒网，后收敛" + "混合自适应阈值"
+            # 1. 循环内: 复用 Step B 邻居，使用混合阈值判定，收集所有潜在边(不去重)。
+            # 2. 循环外: 全局去重，消除双向重复。
             # =================================================================
-            print("[Step C] 基于VOV约束生成候选点 (收集阶段)...")
+            print(f"[Step C] 基于VOV约束生成候选点 (收集与去重)...")
 
-            # 临时列表只存储索引 (int64)，不存坐标 (省显存)
-            raw_edge_u = []  # 起点
-            raw_edge_v = []  # 终点
+            # 计算全局“底噪”基准 (Global Baseline)
+            dt_global = torch.quantile(dist, dt_quantile)
+            print(f" > 全局基准距离 (dt_global): {dt_global:.6f}")
 
-            # 计算长度阈值 (基于 Step B 算出的全局 dist)
-            dt = torch.quantile(dist, dt_quantile)
-            len_threshold = len_threshold_mult * dt
+            # 准备邻居数据张量 (保留在 CPU，随用随拷，节省显存)
+            all_neighbor_dists_t = torch.from_numpy(neighbor_dists_cpu)
+            all_neighbor_indices_t = torch.from_numpy(neighbor_indices_cpu)
+
+            raw_edge_u, raw_edge_v = [], []
             chunk_size = 4096
 
             # 分块处理触发点
             for k in range(0, len(trigger_indices), chunk_size):
                 batch_idx = trigger_indices[k: k + chunk_size]
-                batch_xyz = xyz[batch_idx]
 
-                # 1. KNN 搜索 (K=16, 此时用 torch.cdist 计算局部距离矩阵)
-                # 注意: 这里的 batch_xyz 较小，cdist 不会爆显存
-                dists_k, idxs_k = torch.cdist(batch_xyz, xyz).topk(knn_neighbors + 1, largest=False)
-                local_dists, local_idxs = dists_k[:, 1:], idxs_k[:, 1:]
+                # [优化] 直接从 CPU 提取预计算好的邻居索引，不再运行 torch.cdist
+                batch_idx_cpu = batch_idx.cpu()
+                local_dists = all_neighbor_dists_t[batch_idx_cpu].to(xyz.device).float()
+                local_idxs = all_neighbor_indices_t[batch_idx_cpu].to(xyz.device).long()
 
-                # 2. VOV 可见性检查
+                # VOV 检查 (保持不变)
                 vis_center = gaussian_vis_mask[batch_idx]
                 vis_neighbors = gaussian_vis_mask[local_idxs]
                 has_overlap = (vis_center.unsqueeze(1) & vis_neighbors).any(dim=-1)
 
-                # 3. 策略：优先选择有交集的邻居
+                # 策略：优先选择有可见交集的邻居 (剔除无效邻居)
                 masked_dists_vov = local_dists.clone()
                 masked_dists_vov[~has_overlap] = -1.0
                 max_d_vov, arg_vov = masked_dists_vov.max(dim=1)
 
-                # 4. 降级策略 (Fallback)
-                max_d_raw, arg_raw = local_dists.max(dim=1)
-                use_raw = (max_d_vov < 0)
-                final_arg = torch.where(use_raw, arg_raw, arg_vov)
-                final_max_d = torch.where(use_raw, max_d_raw, max_d_vov)
+                # [关键修改] 删除错误的降级策略 (Fallback)
+                # 如果没有共视邻居，max_d_vov 为 -1.0，自然会被后续阈值过滤，无需特殊处理
+                final_arg = arg_vov
+                final_max_d = max_d_vov
 
-                # 5. 长度筛选
-                valid = final_max_d > len_threshold
+                # [优化] Scheme A: 混合自适应阈值判定
+                # 阈值 = max(全局底线, 局部平均距离 * 倍数)
+                local_density = dist[batch_idx]  # 复用 Step B 的局部平均距离
+                adaptive_threshold = torch.maximum(dt_global, local_density * len_threshold_mult)
+                valid = final_max_d > adaptive_threshold
 
                 if valid.any():
-                    # 获取当前批次中满足条件的 起点 u
                     u_indices = batch_idx[valid]
-                    # 获取对应的 终点 v (从局部索引映射回全局索引)
-                    v_indices = local_idxs[valid].gather(1, final_arg[valid].unsqueeze(1)).squeeze()
+                    # [Fix] squeeze(1) 防止 batch=1 时降维错误
+                    v_indices = local_idxs[valid].gather(1, final_arg[valid].unsqueeze(1)).squeeze(1)
 
-                    # [关键] 直接记录，不做任何去重判断
+                    # 收集原始边 (暂不去重)
                     raw_edge_u.append(u_indices)
                     raw_edge_v.append(v_indices)
 
-            # 如果没有收集到任何边，直接返回
             if not raw_edge_u:
                 print(" > 未找到满足条件的候选边.")
                 return
 
-            # =================================================================
-            # [Step C.5] 全局去重 (Global Deduplication)
-            # =================================================================
+            # [优化] 全局去重 (Global Deduplication)
             print(" > 执行全局双向边去重...")
-
-            # 1. 合并所有批次的索引
             all_u = torch.cat(raw_edge_u)
             all_v = torch.cat(raw_edge_v)
 
-            # 2. 标准化边方向: (u, v) -> (min(u,v), max(u,v))
-            # 这样 (A, B) 和 (B, A) 都会变成同一种形式
-            edges = torch.stack([all_u, all_v], dim=1)  # Shape: (N, 2)
-            edges_sorted, _ = torch.sort(edges, dim=1)  # 行内排序
+            # 排序边: (u, v) -> (min, max)，消除方向性
+            edges = torch.stack([all_u, all_v], dim=1)
+            edges_sorted, _ = torch.sort(edges, dim=1)
+            unique_edges = torch.unique(edges_sorted, dim=0)  # 唯一化
 
-            # 3. 唯一化: 去除重复行
-            unique_edges = torch.unique(edges_sorted, dim=0)
-
-            # 4. 提取去重后的索引
             cand_i_cat = unique_edges[:, 0]
             cand_j_cat = unique_edges[:, 1]
 
-            # 5. 此时才计算中点坐标 (避免了对重复点计算坐标的开销)
+            # 计算中点坐标
             cand_mu_cat = 0.5 * (xyz[cand_i_cat] + xyz[cand_j_cat])
-
             N_cand = cand_mu_cat.shape[0]
             print(f" > 最终生成 {N_cand} 个候选点 (去重后).")
 
