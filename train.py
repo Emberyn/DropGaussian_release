@@ -51,8 +51,14 @@ from arguments import ModelParams, PipelineParams, OptimizationParams
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from,
              pre_densify_args):
-    # 用于记录最后一次评估的指标
-    final_metrics = {"psnr": 0.0, "ssim": 0.0, "lpips": 0.0}
+    # [修改 1] 初始化记录字典，包含点数信息
+    final_metrics = {
+        "psnr": 0.0,
+        "ssim": 0.0,
+        "lpips": 0.0,
+        "added_points": 0,
+        "init_points": 0
+    }
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -67,10 +73,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+    # =================================================================
     # --- SaGPD / aGPD-Lite++ 预密集化执行 ---
-    # [同步修改] 使用字典解包传递所有参数 (包括新增的高级参数)
+    # =================================================================
     if pre_densify_args is not None and pre_densify_args['enabled']:
         try:
+            # [修改 2] 记录初始点数
+            n_before = gaussians.get_xyz.shape[0]
+            final_metrics['init_points'] = n_before
+
             print(f"[SaGPD] 正在执行预密集化校验...")
             gaussians.apply_SaGPD(
                 scene=scene,
@@ -79,6 +90,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # 使用字典推导式过滤掉 'enabled' 键，其余全部传给函数
                 **{k: v for k, v in pre_densify_args.items() if k != 'enabled'}
             )
+
+            # [修改 3] 计算并记录新增点数
+            n_after = gaussians.get_xyz.shape[0]
+            added = n_after - n_before
+            final_metrics['added_points'] = added
+
+            print(f"[SaGPD] 统计: 初始 {n_before} -> 最终 {n_after} (新增 {added})")
+
         except Exception as e:
             # 捕获异常防止中断训练，但打印完整错误栈以便调试
             import traceback
@@ -133,7 +152,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 res = training_report(dataset, tb_writer, iteration, loss, l1_loss, iter_start.elapsed_time(iter_end),
                                       testing_iterations, scene, render, (pipe, background))
                 if res is not None:
-                    final_metrics = res
+                    # [修改 4] 更新指标时，保留之前记录的点数信息
+                    current_added = final_metrics['added_points']
+                    current_init = final_metrics['init_points']
+                    final_metrics = res  # res 会覆盖 metrics，所以要重新赋值点数
+                    final_metrics['added_points'] = current_added
+                    final_metrics['init_points'] = current_init
 
             if (iteration in saving_iterations):
                 print("\n[迭代 {}] 保存模型".format(iteration))
@@ -307,13 +331,19 @@ if __name__ == "__main__":
     print(f"  >> PSNR :  {final_res['psnr']:.4f}")
     print(f"  >> SSIM :  {final_res['ssim']:.4f}")
     print(f"  >> LPIPS:  {final_res['lpips']:.4f}")
+    print(f"  >> Added:  {final_res['added_points']}")
     print("=" * 60)
 
-    # 将结果持久化保存到文件
-    res_file = os.path.join(args.model_path, "final_metrics.txt")
-    with open(res_file, "w") as f:
-        f.write(f"PSNR: {final_res['psnr']:.4f}\n")
-        f.write(f"SSIM: {final_res['ssim']:.4f}\n")
-        f.write(f"LPIPS: {final_res['lpips']:.4f}\n")
+    # [关键修改] 将点数信息写入 metrics_{iterations}.txt
+    # 这样 render.py 和汇总脚本就能读取到这些信息了
+    metrics_file = os.path.join(args.model_path, f"metrics_{args.iterations}.txt")
+    with open(metrics_file, "w") as f:
+        # 1. 写入点数信息 (Render.py 会读取这个)
+        f.write(f"Initial_Points : {final_res['init_points']}\n")
+        f.write(f"Added_Points : {final_res['added_points']}\n")
+        # 2. 写入训练指标 (作为备份)
+        f.write(f"PSNR : {final_res['psnr']:.7f}\n")
+        f.write(f"SSIM : {final_res['ssim']:.7f}\n")
+        f.write(f"LPIPS : {final_res['lpips']:.7f}\n")
 
-    print(f"结果已记录至: {res_file}\n")
+    print(f"结果已记录至: {metrics_file}\n")

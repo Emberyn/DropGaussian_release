@@ -1,3 +1,14 @@
+#
+# Copyright (C) 2023, Inria
+# GRAPHDECO research group, https://team.inria.fr/graphdeco
+# All rights reserved.
+#
+# This software is free for non-commercial, research and evaluation use
+# under the terms of the LICENSE.md file.
+#
+# For inquiries contact  george.drettakis@inria.fr
+#
+
 import torch
 from scene import Scene
 import os
@@ -9,10 +20,28 @@ from utils.general_utils import safe_state
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel
-from utils.general_utils import PILtoTorch
 from utils.image_utils import psnr
 from utils.loss_utils import ssim
-from lpipsPyTorch import lpips
+
+# 尝试导入 LPIPS
+try:
+    from lpipsPyTorch import lpips
+except ImportError:
+    try:
+        from lpips import LPIPS
+
+        # 兼容处理: 如果没有 lpipsPyTorch，使用 standard lpips 库封装一个函数
+        _lpips_model = LPIPS(net='vgg').cuda()
+
+
+        def lpips(img1, img2, net_type='vgg'):
+            return _lpips_model(img1, img2)
+    except ImportError:
+        print("[Warning] LPIPS library not found. Metric will be 0.")
+
+
+        def lpips(img1, img2, net_type='vgg'):
+            return torch.tensor(0.0)
 
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
@@ -24,7 +53,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
     PSNR = []
     SSIM = []
-    LPIPS = []
+    LPIPS_val = []
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         gt = view.original_image[0:3, :, :].cuda()
@@ -32,39 +61,41 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         rendering = render_pkg["render"]
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+
         PSNR.append(psnr(rendering.unsqueeze(0), gt.unsqueeze(0)))
         SSIM.append(ssim(rendering.unsqueeze(0), gt.unsqueeze(0)))
-        LPIPS.append(lpips(rendering.unsqueeze(0), gt.unsqueeze(0), net_type='vgg'))
+        LPIPS_val.append(lpips(rendering.unsqueeze(0), gt.unsqueeze(0), net_type='vgg'))
 
     psnr_mean = torch.tensor(PSNR).mean().item()
     ssim_mean = torch.tensor(SSIM).mean().item()
-    lpips_mean = torch.tensor(LPIPS).mean().item()
+    lpips_mean = torch.tensor(LPIPS_val).mean().item()
 
-    print('\n[Evaluation] {} Set Results:'.format(name))
-    print('PSNR : {:>12.7f}'.format(psnr_mean))
-    print('SSIM : {:>12.7f}'.format(ssim_mean))
-    print('LPIPS : {:>12.7f}'.format(lpips_mean))
+    print(f'\n[Evaluation] {name} Set Results:')
+    print(f'PSNR : {psnr_mean:>12.7f}')
+    print(f'SSIM : {ssim_mean:>12.7f}')
+    print(f'LPIPS : {lpips_mean:>12.7f}')
 
     # ==========================================================
-    # 修复逻辑：读取并保留 train.py 写入的点数信息
+    # [核心修改] 继承 train.py 写入的点数信息
     # ==========================================================
-    metrics_file = os.path.join(model_path, 'metrics_{0}.txt'.format(iteration))
-    point_info_lines = []
+    metrics_file = os.path.join(model_path, 'metrics_{}.txt'.format(iteration))
 
-    # 如果文件已存在（train.py 生成的），提取包含 "Points" 的行
+    # 暂存旧数据
+    existing_lines = []
     if os.path.exists(metrics_file):
         with open(metrics_file, 'r') as f:
-            lines = f.readlines()
-            # 筛选出 Initial_Points 和 Added_Points
-            point_info_lines = [l for l in lines if "Points" in l]
+            # 只保留包含 Points 的行
+            existing_lines = [line for line in f.readlines() if "Points" in line]
 
-    # 重新写入：覆盖指标，但写回点数信息
+    # 重新写入（覆盖模式，但把旧数据写回去）
     with open(metrics_file, 'w') as f:
-        f.write('PSNR : {:>12.7f}\n'.format(psnr_mean))
-        f.write('SSIM : {:>12.7f}\n'.format(ssim_mean))
-        f.write('LPIPS : {:>12.7f}\n'.format(lpips_mean))
-        # 将点数信息追加到末尾
-        for line in point_info_lines:
+        # 1. 写入新的渲染指标
+        f.write(f'PSNR : {psnr_mean:>12.7f}\n')
+        f.write(f'SSIM : {ssim_mean:>12.7f}\n')
+        f.write(f'LPIPS : {lpips_mean:>12.7f}\n')
+
+        # 2. 写回点数信息 (如果存在)
+        for line in existing_lines:
             f.write(line)
 
 

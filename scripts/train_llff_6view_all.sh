@@ -19,6 +19,7 @@
 
 exp_name="llff_sagpd_6view_final_strategy"
 scenes=("fern" "flower" "fortress" "horns" "leaves" "orchids" "room" "trex")
+#scenes=("fern" "flower")
 
 # 安装缺失的库 (自动修复)
 pip install scikit-learn > /dev/null 2>&1
