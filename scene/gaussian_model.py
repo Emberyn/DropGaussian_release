@@ -26,6 +26,8 @@ from tqdm import tqdm
 # 必须确保 diff-gaussian-rasterization 已安装，用于 Fallback 模式
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from sklearn.neighbors import NearestNeighbors
+from scipy.stats import spearmanr
+
 
 class GaussianModel:
     """
@@ -849,18 +851,22 @@ class GaussianModel:
                 grid, align_corners=True, padding_mode="border"  # 边界填充避免越界
             ).squeeze()  # 输出采样深度 (N_valid,)
 
+            # ---------------------------------------------------
+            # [步骤 4 - 改进版] 使用 Spearman 秩相关系数检测单调性
+            # ---------------------------------------------------
+            # 转换数据到 CPU Numpy (spearmanr 不支持 CUDA Tensor)
+            z_gs_np = z_gs.detach().cpu().numpy()
+            d_sample_np = d_sample.detach().cpu().numpy()
 
-            # 较难理解---------------------------------------------------
-            # 步骤4：相关性检查 [对应Algo 2 Line 6-7]
-            # 逻辑：若真实深度z_gs与相对深度d_sample负相关，则翻转d_sample
-            z_mean = z_gs.mean()  # 真实深度均值
-            d_mean = d_sample.mean()  # 相对深度均值
-            # 计算协方差（衡量相关性，cov<0表示负相关）
-            cov = ((z_gs - z_mean) * (d_sample - d_mean)).sum()
+            # 计算斯皮尔曼相关系数 (rho)
+            # 优点：只看排名，不看数值大小，极度抗干扰（抗 Outlier）
+            rho, _ = spearmanr(z_gs_np, d_sample_np)
 
-            is_neg_corr = cov < 0
+            # 如果 rho < 0，说明是负相关（如视差关系），需要翻转
+            is_neg_corr = rho < 0
+
             if is_neg_corr:
-                d_sample = -d_sample  # 临时翻转，保证后续分位数计算的单调性
+                d_sample = -d_sample  # 翻转，强制变为正相关
 
             # 步骤5：分位数计算 [对应Algo 2 Line 8]
             # [参数化修改] 使用 align_ql, align_qh 替换硬编码 0.1, 0.9
