@@ -27,6 +27,7 @@ do
     echo " 正在优化场景: $scene_name"
     echo "============================================================"
 
+<<<<<<< HEAD
     # --- [关键步骤] 参数自动判定逻辑 ---
 
     # 1. 默认设置为 [细节组/激进模式] (适合 Leaves, Horns 等)
@@ -54,11 +55,15 @@ do
     echo " >> 当前参数: KNN=$KNN_VAL | Sparsity=$SPARSITY_VAL | Opacity=$OPACITY_VAL | ErrLimit=$DEPTH_ERR"
 
     # 3. 执行训练
+=======
+    # 1. 执行训练
+>>>>>>> parent of 34429e6 (更改了一点小错误)
     python train.py \
       -s dataset/llff/$scene_name \
       -m output/$exp_name/$scene_name \
       --eval -r 8 --n_views 3 \
       --pre_densify \
+<<<<<<< HEAD
       --pre_knn_neighbors $KNN_VAL \
       --pre_sparsity_threshold $SPARSITY_VAL \
       --pre_opacity_scale $OPACITY_VAL \
@@ -66,6 +71,9 @@ do
       --pre_perturb_strength 0.0 \
       --pre_min_consistency_views 2 \
       --pre_depth_error_limit $DEPTH_ERR
+=======
+      --pre_depth_error_limit 0.01
+>>>>>>> parent of 34429e6 (更改了一点小错误)
 
     # 4. 执行渲染评估
     echo ">> [Render] 正在生成评估图像..."

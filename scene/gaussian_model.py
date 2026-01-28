@@ -705,7 +705,11 @@ class GaussianModel:
 
 
 
+<<<<<<< HEAD
     @torch.no_grad()  # 禁用梯度计算，节省显存并加速计算（该过程无反向传播）
+=======
+    @torch.no_grad()
+>>>>>>> parent of 34429e6 (更改了一点小错误)
     def apply_SaGPD(self, scene, pipe, background,
                     knn_neighbors=16,  # [文档参数] K=16，KNN查找的邻居数量
                     sparsity_threshold=0.7,  # [文档参数] tau_s = Q(D_b, 0.7)，稀疏度分位数阈值
