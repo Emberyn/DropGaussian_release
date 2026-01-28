@@ -26,6 +26,8 @@ from torchvision.utils import save_image
 from torch import nn
 import copy
 import warnings
+import random
+import numpy as np
 
 # 过滤 torchvision 的过时警告
 warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
@@ -49,8 +51,22 @@ except ImportError:
 from arguments import ModelParams, PipelineParams, OptimizationParams
 
 
+def set_seed(seed=0):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # 下面这两行会降低一点点训练速度，但能保证 CUDA 结果尽可能一致
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    print(f"[System] Random Seed Fixed to: {seed}")
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from,
              pre_densify_args):
+    set_seed(0)
+
     # [修改 1] 初始化记录字典，包含点数信息
     final_metrics = {
         "psnr": 0.0,

@@ -963,6 +963,8 @@ class GaussianModel:
             final_arg = arg_vov
             final_max_d = max_d_vov
 
+
+
             # [优化] Scheme A: 混合自适应阈值判定
             # 阈值 = max(全局底线, 局部平均距离 * 倍数)
             local_density = dist[batch_idx]  # 复用 Step B 的局部平均距离
