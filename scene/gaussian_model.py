@@ -769,353 +769,333 @@ class GaussianModel:
                    (p_proj[:, 1] >= -1) & (p_proj[:, 1] <= 1)
             gaussian_vis_mask[:, c_idx] = mask  # 存储该相机的可见性掩码
 
-        # =================================================================
-        # [Step A] DPT深度图加载与对齐 (对应Algorithm 2 Part A)
-        # 核心逻辑: 加载预计算的DPT深度图，通过分位数回归将相对深度对齐到真实度量深度
-        # =================================================================
-        dpt_depth_maps = []  # 存储所有相机的归一化DPT深度图
-        alignment_params = []  # 存储每个相机的深度对齐参数 (a_c, b_c)，用于 z = a_c*d + b_c
 
-        # 检查DPT深度图路径（强制依赖预生成的DPT深度）
+
+        # =================================================================
+        # [Step A] DPT深度图加载与对齐 (修正版: 视差空间对齐 V2)
+        # =================================================================
+        dpt_depth_maps = []
+        alignment_params = []
+
         if hasattr(scene, "source_path"):
-            dpt_dir = os.path.join(scene.source_path, "depths_dpt")  # DPT深度图存储目录
+            dpt_dir = os.path.join(scene.source_path, "depths_dpt")
         else:
-            print("[Error] Scene对象缺少'source_path'属性（无法定位DPT深度图）");
             return
 
         if not os.path.exists(dpt_dir):
-            print(f"[Error] DPT深度图目录不存在: {dpt_dir}（已移除降级策略）");
+            print(f"[Error] DPT深度图目录不存在: {dpt_dir}");
             return
 
-        print("[Step A] 加载并对齐DPT深度图...")
+        print("[Step A] 加载并对齐DPT深度图 (视差模式 V2)...")
 
         # 1. 加载所有训练相机对应的DPT深度图
-        for cam in tqdm(train_cameras, desc="加载DPT深度图"):
-            basename = cam.image_name  # 相机对应的图像名称
-            # 优先查找png格式，不存在则找jpg
+        for cam in tqdm(train_cameras, desc="加载DPT"):
+            basename = cam.image_name
             dpt_path = os.path.join(dpt_dir, basename + ".png")
-            if not os.path.exists(dpt_path):
-                dpt_path = os.path.join(dpt_dir, basename + ".jpg")
+            if not os.path.exists(dpt_path): dpt_path = os.path.join(dpt_dir, basename + ".jpg")
+            if not os.path.exists(dpt_path): return
 
-            if not os.path.exists(dpt_path):
-                print(f"[Error] 相机{basename}缺少DPT深度图");
-                return
-
-            # 读取DPT深度图（无压缩格式，保留原始深度值）
             dpt_img = cv2.imread(dpt_path, cv2.IMREAD_UNCHANGED)
-            # 转换为CUDA张量（float32精度）
             dpt_tensor = torch.tensor(dpt_img.astype(np.float32), device="cuda")
 
-            # 调整深度图尺寸以匹配相机分辨率（避免投影坐标不匹配）
             if dpt_tensor.shape[0] != cam.image_height or dpt_tensor.shape[1] != cam.image_width:
                 dpt_tensor = torch.nn.functional.interpolate(
-                    dpt_tensor.unsqueeze(0).unsqueeze(0),  # 增加batch和channel维度
-                    size=(cam.image_height, cam.image_width),  # 目标尺寸
-                    mode='bilinear', align_corners=False  # 双线性插值（保持深度平滑）
-                ).squeeze()  # 移除多余维度
+                    dpt_tensor.unsqueeze(0).unsqueeze(0),
+                    size=(cam.image_height, cam.image_width),
+                    mode='bilinear', align_corners=False
+                ).squeeze()
 
-            # 将DPT深度归一化到[0,1]（相对深度，消除不同图像的深度范围差异）
             d_min, d_max = dpt_tensor.min(), dpt_tensor.max()
             dpt_norm = (dpt_tensor - d_min) / (d_max - d_min + 1e-8)
             dpt_depth_maps.append(dpt_norm)
 
-        # 2. 计算每个相机的深度对齐参数 (a_c, b_c)（分位数回归 + 相关性检查）
+        # 2. 计算每个相机的对齐参数
         for idx, cam in enumerate(train_cameras):
-            # 步骤1：筛选该相机可见的高斯点（采样S_c集合）[对应Algo 2 Line A.1]
             visible_mask = gaussian_vis_mask[:, idx]
 
-            # 较难理解，疑惑？-------------------------------------------------
-            # [参数化修改] 使用 visible_count_threshold 替换硬编码 50
-            if visible_mask.sum() < visible_count_threshold:  # 可见点过少，使用默认对齐参数
-                alignment_params.append((1.0, 0.0))
+            if visible_mask.sum() < visible_count_threshold:
+                alignment_params.append((0.0, 0.0))  # 默认视差参数
                 continue
 
-            # 步骤2：计算可见点的真实度量深度 z_gs（相机坐标系下的z值）
-            valid_xyz = xyz[visible_mask]  # 该相机可见的高斯点坐标
-            # 转换到相机视图空间 (N_valid, 4)
+            valid_xyz = xyz[visible_mask]
             p_view = torch.cat([valid_xyz, torch.ones_like(valid_xyz[:, :1])], dim=-1) @ cam.world_view_transform
-            # 之后要用到---------------------------------------
-            z_gs = p_view[:, 2]  # 相机视图空间的z值（真实度量深度）
+            z_gs = p_view[:, 2]
 
-            # 步骤3：从DPT深度图中采样对应位置的相对深度 d_sample
-            # 将3D点投影到NDC空间，用于采样深度图
+            # [修正] 计算真实视差 (Inverse Depth)
+            disp_gs = 1.0 / (z_gs + 1e-7)
+
             p_homo = torch.cat([valid_xyz, torch.ones_like(valid_xyz[:, :1])], dim=-1) @ cam.full_proj_transform
             p_w = 1.0 / (p_homo[:, 3] + 1e-7)
-            ndc = p_homo[:, :2] * p_w.unsqueeze(1)  # NDC空间的x/y坐标 (N_valid, 2)
-            grid = ndc.unsqueeze(0).unsqueeze(0)  # 适配grid_sample的输入格式 (1,1,N_valid,2)
+            ndc = p_homo[:, :2] * p_w.unsqueeze(1)
+            grid = ndc.unsqueeze(0).unsqueeze(0)
 
-            # 较难理解
-            # 从DPT深度图中采样对应位置也就是grid中每个坐标（当前视角下的所有可见的点的NDC坐标）的深度值
+            # [修正] 采样 DPT
             d_sample = torch.nn.functional.grid_sample(
-                dpt_depth_maps[idx].unsqueeze(0).unsqueeze(0),  # 输入深度图 (1,1,H,W)
-                grid, align_corners=True, padding_mode="border"  # 边界填充避免越界
-            ).squeeze()  # 输出采样深度 (N_valid,)
+                dpt_depth_maps[idx].unsqueeze(0).unsqueeze(0),
+                grid, align_corners=False, padding_mode="border"
+            ).reshape(-1)
 
-            # ---------------------------------------------------
-            # [步骤 4 - 改进版] 使用 Spearman 秩相关系数检测单调性
-            # ---------------------------------------------------
-            # 转换数据到 CPU Numpy (spearmanr 不支持 CUDA Tensor)
-            z_gs_np = z_gs.detach().cpu().numpy()
+            # [修正] 变量名更清晰，避免混淆
+            disp_gs_np = disp_gs.detach().cpu().numpy()
             d_sample_np = d_sample.detach().cpu().numpy()
 
-            # 计算斯皮尔曼相关系数 (rho)
-            # 优点：只看排名，不看数值大小，极度抗干扰（抗 Outlier）
-            rho, _ = spearmanr(z_gs_np, d_sample_np)
+            # 计算相关性: 理论上 DPT(视差) 和 disp_gs(视差) 应该是正相关
+            rho, _ = spearmanr(disp_gs_np, d_sample_np)
 
-            # 如果 rho < 0，说明是负相关（如视差关系），需要翻转
+            # 如果是负相关，说明 DPT 可能反相了，翻转它
             is_neg_corr = rho < 0
+            if is_neg_corr: d_sample = -d_sample
 
-            if is_neg_corr:
-                d_sample = -d_sample  # 翻转，强制变为正相关
-
-            # 步骤5：分位数计算 [对应Algo 2 Line 8]
-            # [参数化修改] 使用 align_ql, align_qh 替换硬编码 0.1, 0.9
+            # 分位数回归
             q_l, q_h = align_ql, align_qh
-            z_l, z_h = torch.quantile(z_gs, q_l), torch.quantile(z_gs, q_h)  # 真实深度的分位数
-            d_l, d_h = torch.quantile(d_sample, q_l), torch.quantile(d_sample, q_h)  # 相对深度的分位数
+            disp_l, disp_h = torch.quantile(disp_gs, q_l), torch.quantile(disp_gs, q_h)
+            d_l, d_h = torch.quantile(d_sample, q_l), torch.quantile(d_sample, q_h)
 
-            # 步骤6：计算对齐参数 a_c (斜率) 和 b_c (截距) [对应Algo 2 Line 9]
-            # 较难理解，为什么可以这么处理，或许是一个改进点---------------------
-            if abs(d_h - d_l) < 1e-6:  # 深度范围过小，避免除零
-                a_c = 1.0
+            if abs(d_h - d_l) < 1e-7:
+                a_c = 0.0
             else:
-                a_c = (z_h - z_l) / (d_h - d_l)  # 斜率：将相对深度映射到真实深度
-            b_c = z_l - a_c * d_l  # 截距
+                a_c = (disp_h - disp_l) / (d_h - d_l)
+            b_c = disp_l - a_c * d_l
 
-            # 较难理解，这里也需要仔细对照-----------------------------------
-            # 修正：若原始相关性为负，需翻转斜率（因为之前临时翻转了d_sample）
-            # 推导：z = a_temp*(-d) + b = (-a_temp)*d + b → a_c = -a_temp
-            if is_neg_corr:
-                a_c = -a_c
-
-            # 较难理解，为什么要保存------------------------------------
-            alignment_params.append((a_c, b_c))  # 保存该相机的对齐参数
-
-
-            # =================================================================
-            # [Step B] 稀疏触发 (对应Algorithm 2 Part B)
-            # 核心逻辑: 使用 sklearn 计算精确的 K 近邻 (距离+索引)，供 Step C 复用
-            # =================================================================
-            print(f"[Step B] 计算点云稀疏度 (CPU sklearn, K={knn_neighbors})...")
-
-            # 1. 数据转换: CUDA Tensor -> CPU Numpy
-            points_np = xyz.detach().cpu().numpy()
-
-            # 2. 全局 KNN 搜索 (CPU 并行)
-            # n_neighbors = K + 1 (排除自身)
-            nbrs = NearestNeighbors(n_neighbors=knn_neighbors + 1, algorithm='auto', metric='euclidean', n_jobs=-1)
-            nbrs.fit(points_np)
-
-            # 获取所有点的距离和索引 (供 Step C 复用)
-            dists_all, indices_all = nbrs.kneighbors(points_np)
-
-            # 3. 提取有效邻居 (去掉第0列自身)
-            neighbor_dists_cpu = dists_all[:, 1:]  # (N, K)
-            neighbor_indices_cpu = indices_all[:, 1:]  # (N, K)
-
-            # 4. 计算局部平均距离 (用于稀疏度判定)
-            mean_dists = neighbor_dists_cpu.mean(axis=1)
-            dist = torch.from_numpy(mean_dists).float().to(xyz.device)
-
-            # 5. 计算稀疏度阈值并筛选触发点 (保持原有逻辑)
-            d_min, d_max = dist.min(), dist.max()
-            d_bi = (dist - d_min) / (d_max - d_min + 1e-8)
-            tau_s = torch.quantile(d_bi, sparsity_threshold)
-
-            trigger_indices = torch.where(d_bi > tau_s)[0]
-            if len(trigger_indices) == 0: return
-
-            # =================================================================
-            # [Step C] 候选点生成 (对应Algorithm 2 Part C)
-            # 优化策略: "广撒网，后收敛" + "混合自适应阈值"
-            # 1. 循环内: 复用 Step B 邻居，使用混合阈值判定，收集所有潜在边(不去重)。
-            # 2. 循环外: 全局去重，消除双向重复。
-            # =================================================================
-            print(f"[Step C] 基于VOV约束生成候选点 (收集与去重)...")
-
-            # 计算全局“底噪”基准 (Global Baseline)
-            dt_global = torch.quantile(dist, dt_quantile)
-            print(f" > 全局基准距离 (dt_global): {dt_global:.6f}")
-
-            # 准备邻居数据张量 (保留在 CPU，随用随拷，节省显存)
-            all_neighbor_dists_t = torch.from_numpy(neighbor_dists_cpu)
-            all_neighbor_indices_t = torch.from_numpy(neighbor_indices_cpu)
-
-            raw_edge_u, raw_edge_v = [], []
-            chunk_size = 4096
-
-            # 分块处理触发点
-            for k in range(0, len(trigger_indices), chunk_size):
-                batch_idx = trigger_indices[k: k + chunk_size]
-
-                # [优化] 直接从 CPU 提取预计算好的邻居索引，不再运行 torch.cdist
-                batch_idx_cpu = batch_idx.cpu()
-                local_dists = all_neighbor_dists_t[batch_idx_cpu].to(xyz.device).float()
-                local_idxs = all_neighbor_indices_t[batch_idx_cpu].to(xyz.device).long()
-
-                # VOV 检查 (保持不变)
-                vis_center = gaussian_vis_mask[batch_idx]
-                vis_neighbors = gaussian_vis_mask[local_idxs]
-                has_overlap = (vis_center.unsqueeze(1) & vis_neighbors).any(dim=-1)
-
-                # 策略：优先选择有可见交集的邻居 (剔除无效邻居)
-                masked_dists_vov = local_dists.clone()
-                masked_dists_vov[~has_overlap] = -1.0
-                max_d_vov, arg_vov = masked_dists_vov.max(dim=1)
-
-                # [关键修改] 删除错误的降级策略 (Fallback)
-                # 如果没有共视邻居，max_d_vov 为 -1.0，自然会被后续阈值过滤，无需特殊处理
-                final_arg = arg_vov
-                final_max_d = max_d_vov
-
-                # [优化] Scheme A: 混合自适应阈值判定
-                # 阈值 = max(全局底线, 局部平均距离 * 倍数)
-                local_density = dist[batch_idx]  # 复用 Step B 的局部平均距离
-                adaptive_threshold = torch.maximum(dt_global, local_density * len_threshold_mult)
-                valid = final_max_d > adaptive_threshold
-
-                if valid.any():
-                    u_indices = batch_idx[valid]
-                    # [Fix] squeeze(1) 防止 batch=1 时降维错误
-                    v_indices = local_idxs[valid].gather(1, final_arg[valid].unsqueeze(1)).squeeze(1)
-
-                    # 收集原始边 (暂不去重)
-                    raw_edge_u.append(u_indices)
-                    raw_edge_v.append(v_indices)
-
-            if not raw_edge_u:
-                print(" > 未找到满足条件的候选边.")
-                return
-
-            # [优化] 全局去重 (Global Deduplication)
-            print(" > 执行全局双向边去重...")
-            all_u = torch.cat(raw_edge_u)
-            all_v = torch.cat(raw_edge_v)
-
-            # 排序边: (u, v) -> (min, max)，消除方向性
-            edges = torch.stack([all_u, all_v], dim=1)
-            edges_sorted, _ = torch.sort(edges, dim=1)
-            unique_edges = torch.unique(edges_sorted, dim=0)  # 唯一化
-
-            cand_i_cat = unique_edges[:, 0]
-            cand_j_cat = unique_edges[:, 1]
-
-            # 计算中点坐标
-            cand_mu_cat = 0.5 * (xyz[cand_i_cat] + xyz[cand_j_cat])
-            N_cand = cand_mu_cat.shape[0]
-            print(f" > 最终生成 {N_cand} 个候选点 (去重后).")
-
-
+            if is_neg_corr: a_c = -a_c
+            alignment_params.append((a_c, b_c))
 
 
         # =================================================================
-        # [Step D] 动态分位数阈值与过滤 (对应Algorithm 2 Part D)
-        # 核心逻辑: 计算候选点在各相机的深度误差，基于动态阈值筛选满足一致性的候选点
+        # [Step B] 稀疏触发 (对应Algorithm 2 Part B)
+        # 核心逻辑: 使用 sklearn 计算精确的 K 近邻 (距离+索引)，供 Step C 复用
         # =================================================================
-        print(f"[Step D] 动态阈值计算与候选点过滤...")
+        print(f"[Step B] 计算点云稀疏度 (CPU sklearn, K={knn_neighbors})...")
+
+        # 1. 数据转换: CUDA Tensor -> CPU Numpy
+        points_np = xyz.detach().cpu().numpy()
+
+        # 2. 全局 KNN 搜索 (CPU 并行)
+        # n_neighbors = K + 1 (排除自身)
+        nbrs = NearestNeighbors(n_neighbors=knn_neighbors + 1, algorithm='auto', metric='euclidean', n_jobs=-1)
+        nbrs.fit(points_np)
+
+        # 获取所有点的距离和索引 (供 Step C 复用)
+        dists_all, indices_all = nbrs.kneighbors(points_np)
+
+        # 3. 提取有效邻居 (去掉第0列自身)
+        neighbor_dists_cpu = dists_all[:, 1:]  # (N, K)
+        neighbor_indices_cpu = indices_all[:, 1:]  # (N, K)
+
+        # 4. 计算局部平均距离 (用于稀疏度判定)
+        mean_dists = neighbor_dists_cpu.mean(axis=1)
+        dist = torch.from_numpy(mean_dists).float().to(xyz.device)
+
+        # 5. 计算稀疏度阈值并筛选触发点 (保持原有逻辑)
+        d_min, d_max = dist.min(), dist.max()
+        d_bi = (dist - d_min) / (d_max - d_min + 1e-8)
+        tau_s = torch.quantile(d_bi, sparsity_threshold)
+
+        trigger_indices = torch.where(d_bi > tau_s)[0]
+        if len(trigger_indices) == 0: return
+
+        # =================================================================
+        # [Step C] 候选点生成 (对应Algorithm 2 Part C)
+        # 优化策略: "广撒网，后收敛" + "混合自适应阈值"
+        # 1. 循环内: 复用 Step B 邻居，使用混合阈值判定，收集所有潜在边(不去重)。
+        # 2. 循环外: 全局去重，消除双向重复。
+        # =================================================================
+        print(f"[Step C] 基于VOV约束生成候选点 (收集与去重)...")
+
+        # 计算全局“底噪”基准 (Global Baseline)
+        dt_global = torch.quantile(dist, dt_quantile)
+        print(f" > 全局基准距离 (dt_global): {dt_global:.6f}")
+
+        # 准备邻居数据张量 (保留在 CPU，随用随拷，节省显存)
+        all_neighbor_dists_t = torch.from_numpy(neighbor_dists_cpu)
+        all_neighbor_indices_t = torch.from_numpy(neighbor_indices_cpu)
+
+        raw_edge_u, raw_edge_v = [], []
+        chunk_size = 4096
+
+        # 分块处理触发点
+        for k in range(0, len(trigger_indices), chunk_size):
+            batch_idx = trigger_indices[k: k + chunk_size]
+
+            # [优化] 直接从 CPU 提取预计算好的邻居索引，不再运行 torch.cdist
+            batch_idx_cpu = batch_idx.cpu()
+            local_dists = all_neighbor_dists_t[batch_idx_cpu].to(xyz.device).float()
+            local_idxs = all_neighbor_indices_t[batch_idx_cpu].to(xyz.device).long()
+
+            # VOV 检查 (保持不变)
+            vis_center = gaussian_vis_mask[batch_idx]
+            vis_neighbors = gaussian_vis_mask[local_idxs]
+            has_overlap = (vis_center.unsqueeze(1) & vis_neighbors).any(dim=-1)
+
+            # 策略：优先选择有可见交集的邻居 (剔除无效邻居)
+            masked_dists_vov = local_dists.clone()
+            masked_dists_vov[~has_overlap] = -1.0
+            max_d_vov, arg_vov = masked_dists_vov.max(dim=1)
+
+            # [关键修改] 删除错误的降级策略 (Fallback)
+            # 如果没有共视邻居，max_d_vov 为 -1.0，自然会被后续阈值过滤，无需特殊处理
+            final_arg = arg_vov
+            final_max_d = max_d_vov
+
+            # [优化] Scheme A: 混合自适应阈值判定
+            # 阈值 = max(全局底线, 局部平均距离 * 倍数)
+            local_density = dist[batch_idx]  # 复用 Step B 的局部平均距离
+            adaptive_threshold = torch.maximum(dt_global, local_density * len_threshold_mult)
+            valid = final_max_d > adaptive_threshold
+
+            if valid.any():
+                u_indices = batch_idx[valid]
+                # [Fix] squeeze(1) 防止 batch=1 时降维错误
+                v_indices = local_idxs[valid].gather(1, final_arg[valid].unsqueeze(1)).squeeze(1)
+
+                # 收集原始边 (暂不去重)
+                raw_edge_u.append(u_indices)
+                raw_edge_v.append(v_indices)
+
+        if not raw_edge_u:
+            print(" > 未找到满足条件的候选边.")
+            return
+
+        # [优化] 全局去重 (Global Deduplication)
+        print(" > 执行全局双向边去重...")
+        all_u = torch.cat(raw_edge_u)
+        all_v = torch.cat(raw_edge_v)
+
+        # 排序边: (u, v) -> (min, max)，消除方向性
+        edges = torch.stack([all_u, all_v], dim=1)
+        edges_sorted, _ = torch.sort(edges, dim=1)
+        unique_edges = torch.unique(edges_sorted, dim=0)  # 唯一化
+
+        cand_i_cat = unique_edges[:, 0]
+        cand_j_cat = unique_edges[:, 1]
+
+        # 计算中点坐标
+        cand_mu_cat = 0.5 * (xyz[cand_i_cat] + xyz[cand_j_cat])
+        N_cand = cand_mu_cat.shape[0]
+        print(f" > 最终生成 {N_cand} 个候选点 (去重后).")
+
+        # =================================================================
+        # [Step D] 动态分位数阈值与过滤 (定制版: 视差误差 + 几何共识)
+        # 策略:
+        # 1. 视差空间误差 (解决远近不一致)
+        # 2. 多视角几何共识 (利用加权平均修复位置)
+        # 3. 仅使用 min_views 过滤 (移除通过率限制，保证最大召回)
+        # =================================================================
+        print(f"[Step D] 动态阈值计算与候选点过滤 (High Recall + Consensus Fix)...")
 
         # 初始化统计变量
-        pass_counts = torch.zeros(N_cand, dtype=torch.int32, device="cuda")  # 每个候选点通过误差检查的视角数
-        valid_view_counts = torch.zeros(N_cand, dtype=torch.int32, device="cuda")  # 每个候选点的有效视角数 |C_check|
-
-        # 记录每个候选点的最佳视角（用于后续几何纠偏）
-        best_view_idx = torch.full((N_cand,), -1, dtype=torch.long, device="cuda")  # 最佳视角索引
-        best_z_ref = torch.zeros(N_cand, device="cuda")  # 最佳视角的目标深度z_ref
-        min_view_error = torch.full((N_cand,), 1e9, device="cuda")  # 最小深度误差
-
-        # 临时误差矩阵 (N_cand, N_cams)，存储每个候选点在每个相机的深度误差（nan表示无效）
+        # z_ref_matrix: 存储所有视角的预测深度，用于后续计算加权平均
+        z_ref_matrix = torch.full((N_cand, N_cams), float('nan'), device="cuda")
+        # error_matrix: 存储视差误差
         error_matrix = torch.full((N_cand, N_cams), float('nan'), device="cuda")
 
-        # 候选点转换为齐次坐标，方便投影计算
+        # 辅助变量
+        valid_view_counts = torch.zeros(N_cand, dtype=torch.int32, device="cuda")
+        min_view_error = torch.full((N_cand,), 1e9, device="cuda")
+        best_view_idx = torch.full((N_cand,), -1, dtype=torch.long, device="cuda")
+        # best_z_ref 先存占位符，稍后会用共识深度覆盖
+        best_z_ref = torch.zeros(N_cand, device="cuda")
+
+        # 候选点转换为齐次坐标
         cand_homo = torch.cat([cand_mu_cat, torch.ones(N_cand, 1, device="cuda")], dim=-1)
 
-        # Phase 1: 遍历所有相机，计算候选点的深度误差 [对应Algo 2 Part D循环]
+        # Phase 1: 遍历相机，计算视差误差并收集深度建议
         for idx, cam in enumerate(train_cameras):
-            # 步骤1：将候选点投影到相机NDC空间，判断是否在视锥内
+            # --- 投影与视锥检查 ---
             p_proj = cand_homo @ cam.full_proj_transform
             p_w = 1.0 / (p_proj[:, 3] + 1e-7)
-            ndc = p_proj[:, :2] * p_w.unsqueeze(1)  # NDC空间x/y坐标
+            ndc = p_proj[:, :2] * p_w.unsqueeze(1)
 
-            # 视锥检查：候选点是否在该相机可见范围内
             in_view = (p_proj[:, 2] > 0) & (ndc[:, 0] >= -1) & (ndc[:, 0] <= 1) & \
                       (ndc[:, 1] >= -1) & (ndc[:, 1] <= 1)
 
-            if not in_view.any():  # 该相机无有效候选点，跳过
-                continue
+            if not in_view.any(): continue
 
-            # 理解：比较关键的变量，当前视角下的所有可见的候选点的索引
-            valid_indices = torch.where(in_view)[0]  # 返回的是一列索引中的部分索引
-
-            # 记录有效视角数（分母 |C_check|）
+            valid_indices = torch.where(in_view)[0]
             valid_view_counts[valid_indices] += 1
 
-            # 步骤2：从DPT深度图采样并对齐，得到目标深度z_ref [对应Algo 2 Line A.10]
-            #  (1, 1, M, 2)
+            # --- DPT采样 (保持 align_corners=False) ---
             grid = ndc[valid_indices].unsqueeze(0).unsqueeze(0)
-            # 采样DPT相对深度
             d_raw = torch.nn.functional.grid_sample(
-                dpt_depth_maps[idx].unsqueeze(0).unsqueeze(0),  # (1, 1, H, W)
-                grid, align_corners=True, padding_mode="border"
-            ).squeeze()
-            # 得到（M,）
+                dpt_depth_maps[idx].unsqueeze(0).unsqueeze(0),
+                grid, align_corners=False, padding_mode="border"
+            ).reshape(-1)
 
-            # 应用对齐参数，将相对深度转换为度量深度 z_ref (z_render)
+            # --- 计算预测视差 (依赖 Step A 的视差对齐) ---
             a_c, b_c = alignment_params[idx]
-            z_ref = a_c * d_raw + b_c
+            disp_pred = a_c * d_raw + b_c
 
-            # 步骤3：计算候选点的真实度量深度 z_metric
+            # 记录预测的 metric depth (用于后续共识计算)
+            # [安全约束] 限制最小视差为 1e-5，防止深度(1/disp)爆炸到无穷大
+            safe_disp = torch.clamp(disp_pred, min=1e-5)
+            z_ref_matrix[valid_indices, idx] = 1.0 / safe_disp
+
+            # --- 计算真实视差 (Metric Disparity) ---
             p_view = cand_homo[valid_indices] @ cam.world_view_transform
             z_metric = p_view[:, 2]
+            disp_metric = 1.0 / (z_metric + 1e-7)
 
-            # 步骤4：计算深度误差 e = |z_metric - z_ref| [对应Algo 2 Line D.6]
-            # diff只存储「当前视角有效点」的误差，索引范围是0~M - 1（局部索引），M是当前视角下的有效点数量
-            diff = torch.abs(z_metric - z_ref)
-
-            # 存入误差矩阵,一列
+            # --- 计算视差误差 (关键: 相对性误差) ---
+            diff = torch.abs(disp_metric - disp_pred)
             error_matrix[valid_indices, idx] = diff
 
-            # 更新最佳视角：选择误差最小的视角（用于后续几何纠偏）
-            # better：布尔掩码 (M,)，标记当前视角误差是否小于该点已记录的最小视角误差（True=当前视角更优）
+            # --- 更新最佳视角 ---
             better = diff < min_view_error[valid_indices]
-            # update_idx：提取需要更新的有效点全局索引（筛选出当前视角更优的点）
             update_idx = valid_indices[better]
-            # 更新这些点的最小视角误差为当前视角的误差值
-            # 一维，N_rand
             min_view_error[update_idx] = diff[better]
-            # 记录这些点的最佳视角索引为当前处理的视角idx
             best_view_idx[update_idx] = idx
-            # 更新这些点的最佳参考深度为当前视角采样得到的z_ref
-            best_z_ref[update_idx] = z_ref[better]
+            # 注意：这里暂不更新 best_z_ref，留给 Phase 3 做共识计算
 
-        # Phase 2: 计算动态阈值 eta_o [对应Eq.7]
-        # eta_o = Q(Error_set, 0.9)：所有有效误差的90%分位数
-        valid_mask_global = ~torch.isnan(error_matrix)  # 有效误差掩码，二维
-        all_valid_errors = error_matrix[valid_mask_global]  # 所有有效误差值，一维
+        # Phase 2: 计算动态阈值 eta_o
+        valid_mask_global = ~torch.isnan(error_matrix)
+        all_valid_errors = error_matrix[valid_mask_global]
 
-        if len(all_valid_errors) == 0:  # 无有效误差，直接返回
-            return
+        if len(all_valid_errors) == 0: return
 
-        # [参数化修改] 使用 eta_o_quantile 替换硬编码 0.9
         eta_o = torch.quantile(all_valid_errors, eta_o_quantile)
-        # 最小值保护：避免阈值过小导致除零（工程鲁棒性）
-        eta_o = torch.maximum(eta_o, torch.tensor(1e-8, device="cuda"))
-        print(f" > 动态误差阈值 (eta_o, q={eta_o_quantile}): {eta_o:.4f}")
+        eta_o = torch.maximum(eta_o, torch.tensor(1e-6, device="cuda"))
+        print(f" > 动态误差阈值 (视差空间 eta_o, q={eta_o_quantile}): {eta_o:.6f}")
 
-        # Phase 3: 应用阈值过滤 [对应Algo 2 Line D.7]
-        # 仅保留误差小于eta_o的视角
-        pass_mask = error_matrix < eta_o
-        pass_mask = pass_mask & valid_mask_global  # 仅考虑有效视角
-        pass_counts = pass_mask.sum(dim=1)  # 每个候选点通过的视角数
+        # Phase 3: 过滤与共识计算
+        # 1. 基础阈值过滤
+        pass_mask = (error_matrix < eta_o) & valid_mask_global
+        pass_counts = pass_mask.sum(dim=1)
 
-        # 最终筛选：通过视角数 >= min_views [对应Algo 2 Line D.8]
-        final_mask = pass_counts >= min_views
-        # 同时过滤掉无最佳视角的候选点
-        # 理解：有了通过视角数不就有了最佳视角吗？为什么还要特地判断？
-        final_idx = torch.where(final_mask & (best_view_idx != -1))[0]
+        # 2. [已移除通过率检查]
+        # 策略: 宁可错杀一千噪声，不可放过一个细节。依靠后续的共识深度来纠正位置。
+
+        # 3. 组合掩码
+        final_mask = (pass_counts >= min_views) & (best_view_idx != -1)
+        final_idx = torch.where(final_mask)[0]
 
         if len(final_idx) == 0:
             print(" > 无候选点通过一致性检查.")
             return
+
+        # 4. 多视角几何共识 (Geometric Consensus)
+        # 计算所有通过视角的加权平均深度，提升几何精度
+        print(" > 计算多视角几何共识...")
+
+        # 提取通过筛选的误差 (未通过的设为 inf)
+        valid_errors = error_matrix.clone()
+        valid_errors[~pass_mask] = float('inf')
+
+        # 计算权重 (误差越小权重越大，Inverse Error Weighting)
+        weights = 1.0 / (valid_errors + 1e-5)
+        weights[~pass_mask] = 0.0  # 再次确保掩码，未通过者权重为0
+
+        # 加权平均深度: sum(w * z) / sum(w)
+        # nan_to_num 确保 z_ref 中的 nan 变成 0，不影响求和
+        weighted_z_sum = (weights * torch.nan_to_num(z_ref_matrix, 0.0)).sum(dim=1)
+        weight_sum = weights.sum(dim=1)
+
+        # 加上 1e-8 防止除零
+        consensus_z = weighted_z_sum / (weight_sum + 1e-8)
+
+        # 将共识深度赋值给 best_z_ref，供 Step E 直接使用
+        best_z_ref[final_idx] = consensus_z[final_idx]
+
+
 
         # =================================================================
         # [Step E] 几何纠偏 (对应Algorithm 2 Part E)
