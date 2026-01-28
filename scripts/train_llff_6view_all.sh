@@ -35,10 +35,10 @@ do
       --eval -r 8 --n_views 6 \
       --pre_densify \
       --pre_knn_neighbors 16 \
-      --pre_min_consistency_views 3 \
+      --pre_min_consistency_views 2 \
       --pre_size_shrink 1.5 \
       --pre_opacity_scale 0.5 \
-      --pre_sparsity_threshold 0.5 \
+      --pre_sparsity_threshold 0.4 \
       --pre_dt_quantile 0.6 \
       --pre_len_threshold_mult 2.0 \
       --pre_eta_o_quantile 0.9 \

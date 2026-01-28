@@ -768,123 +768,86 @@ class GaussianModel:
                    (p_proj[:, 1] >= -1) & (p_proj[:, 1] <= 1)
             gaussian_vis_mask[:, c_idx] = mask  # 存储该相机的可见性掩码
 
-        # =================================================================
-        # [Step A] DPT深度图加载与对齐 (对应Algorithm 2 Part A)
-        # 核心逻辑: 加载预计算的DPT深度图，通过分位数回归将相对深度对齐到真实度量深度
-        # =================================================================
-        dpt_depth_maps = []  # 存储所有相机的归一化DPT深度图
-        alignment_params = []  # 存储每个相机的深度对齐参数 (a_c, b_c)，用于 z = a_c*d + b_c
 
-        # 检查DPT深度图路径（强制依赖预生成的DPT深度）
+        # [Step A] (ZoeDepth Version: 读取新文件夹 + 线性对齐)
+        # =================================================================
+        dpt_depth_maps = []
+        alignment_params = []
+
         if hasattr(scene, "source_path"):
-            dpt_dir = os.path.join(scene.source_path, "depths_dpt")  # DPT深度图存储目录
+            # [修改点] 读取新文件夹 depths_dpt_ZoeDepth
+            dpt_dir = os.path.join(scene.source_path, "depths_dpt_ZoeDepth")
         else:
-            print("[Error] Scene对象缺少'source_path'属性（无法定位DPT深度图）");
             return
 
         if not os.path.exists(dpt_dir):
-            print(f"[Error] DPT深度图目录不存在: {dpt_dir}（已移除降级策略）");
+            print(f"[Error] ZoeDepth dir not found: {dpt_dir}")
+            print("Please run generate_dpt.py first!")
             return
 
-        print("[Step A] 加载并对齐DPT深度图...")
+        print("[Step A] 加载并对齐 ZoeDepth 深度图 (Linear Metric Mode)...")
 
-        # 1. 加载所有训练相机对应的DPT深度图
-        for cam in tqdm(train_cameras, desc="加载DPT深度图"):
-            basename = cam.image_name  # 相机对应的图像名称
-            # 优先查找png格式，不存在则找jpg
+        # 1. 加载深度图 (纯加载，不归一化)
+        for cam in tqdm(train_cameras, desc="加载ZoeDepth"):
+            basename = cam.image_name
             dpt_path = os.path.join(dpt_dir, basename + ".png")
-            if not os.path.exists(dpt_path):
-                dpt_path = os.path.join(dpt_dir, basename + ".jpg")
 
-            if not os.path.exists(dpt_path):
-                print(f"[Error] 相机{basename}缺少DPT深度图");
-                return
-
-            # 读取DPT深度图（无压缩格式，保留原始深度值）
+            # 读取原始 uint16
             dpt_img = cv2.imread(dpt_path, cv2.IMREAD_UNCHANGED)
-            # 转换为CUDA张量（float32精度）
             dpt_tensor = torch.tensor(dpt_img.astype(np.float32), device="cuda")
 
-            # 调整深度图尺寸以匹配相机分辨率（避免投影坐标不匹配）
+            # Resize 匹配
             if dpt_tensor.shape[0] != cam.image_height or dpt_tensor.shape[1] != cam.image_width:
                 dpt_tensor = torch.nn.functional.interpolate(
-                    dpt_tensor.unsqueeze(0).unsqueeze(0),  # 增加batch和channel维度
-                    size=(cam.image_height, cam.image_width),  # 目标尺寸
-                    mode='bilinear', align_corners=False  # 双线性插值（保持深度平滑）
-                ).squeeze()  # 移除多余维度
+                    dpt_tensor.unsqueeze(0).unsqueeze(0),
+                    size=(cam.image_height, cam.image_width),
+                    mode='bilinear', align_corners=False
+                ).squeeze()
 
-            # 将DPT深度归一化到[0,1]（相对深度，消除不同图像的深度范围差异）
-            d_min, d_max = dpt_tensor.min(), dpt_tensor.max()
-            dpt_norm = (dpt_tensor - d_min) / (d_max - d_min + 1e-8)
-            dpt_depth_maps.append(dpt_norm)
+            dpt_depth_maps.append(dpt_tensor)
 
-        # 2. 计算每个相机的深度对齐参数 (a_c, b_c)（分位数回归 + 相关性检查）
+        # 2. 计算每个相机的线性对齐参数 (a_c, b_c)
         for idx, cam in enumerate(train_cameras):
-            # 步骤1：筛选该相机可见的高斯点（采样S_c集合）[对应Algo 2 Line A.1]
             visible_mask = gaussian_vis_mask[:, idx]
 
-            # 较难理解，疑惑？-------------------------------------------------
-            # [参数化修改] 使用 visible_count_threshold 替换硬编码 50
-            if visible_mask.sum() < visible_count_threshold:  # 可见点过少，使用默认对齐参数
+            # 理解，真的可以这么做吗？
+            if visible_mask.sum() < visible_count_threshold:
                 alignment_params.append((1.0, 0.0))
                 continue
 
-            # 步骤2：计算可见点的真实度量深度 z_gs（相机坐标系下的z值）
-            valid_xyz = xyz[visible_mask]  # 该相机可见的高斯点坐标
-            # 转换到相机视图空间 (N_valid, 4)
+            # 获取真实深度 (Metric Depth)
+            valid_xyz = xyz[visible_mask]
             p_view = torch.cat([valid_xyz, torch.ones_like(valid_xyz[:, :1])], dim=-1) @ cam.world_view_transform
-            # 之后要用到---------------------------------------
-            z_gs = p_view[:, 2]  # 相机视图空间的z值（真实度量深度）
+            z_gs = p_view[:, 2]  # COLMAP Z
 
-            # 步骤3：从DPT深度图中采样对应位置的相对深度 d_sample
-            # 将3D点投影到NDC空间，用于采样深度图
+            # 采样 ZoeDepth
             p_homo = torch.cat([valid_xyz, torch.ones_like(valid_xyz[:, :1])], dim=-1) @ cam.full_proj_transform
             p_w = 1.0 / (p_homo[:, 3] + 1e-7)
-            ndc = p_homo[:, :2] * p_w.unsqueeze(1)  # NDC空间的x/y坐标 (N_valid, 2)
-            grid = ndc.unsqueeze(0).unsqueeze(0)  # 适配grid_sample的输入格式 (1,1,N_valid,2)
+            ndc = p_homo[:, :2] * p_w.unsqueeze(1)
+            grid = ndc.unsqueeze(0).unsqueeze(0)
 
-            # 较难理解
-            # 从DPT深度图中采样对应位置也就是grid中每个坐标（当前视角下的所有可见的点的NDC坐标）的深度值
             d_sample = torch.nn.functional.grid_sample(
-                dpt_depth_maps[idx].unsqueeze(0).unsqueeze(0),  # 输入深度图 (1,1,H,W)
-                grid, align_corners=True, padding_mode="border"  # 边界填充避免越界
-            ).squeeze()  # 输出采样深度 (N_valid,)
+                dpt_depth_maps[idx].unsqueeze(0).unsqueeze(0),
+                grid, align_corners=True, padding_mode="border"
+            ).squeeze()
 
+            # 3. 线性分位数回归 (Quantile Regression)
+            # 公式: Z_colmap = a * Z_zoe + b
+            z_l, z_h = torch.quantile(z_gs, align_ql), torch.quantile(z_gs, align_qh)
+            d_l, d_h = torch.quantile(d_sample, align_ql), torch.quantile(d_sample, align_qh)
 
-            # 较难理解---------------------------------------------------
-            # 步骤4：相关性检查 [对应Algo 2 Line 6-7]
-            # 逻辑：若真实深度z_gs与相对深度d_sample负相关，则翻转d_sample
-            z_mean = z_gs.mean()  # 真实深度均值
-            d_mean = d_sample.mean()  # 相对深度均值
-            # 计算协方差（衡量相关性，cov<0表示负相关）
-            cov = ((z_gs - z_mean) * (d_sample - d_mean)).sum()
-
-            is_neg_corr = cov < 0
-            if is_neg_corr:
-                d_sample = -d_sample  # 临时翻转，保证后续分位数计算的单调性
-
-            # 步骤5：分位数计算 [对应Algo 2 Line 8]
-            # [参数化修改] 使用 align_ql, align_qh 替换硬编码 0.1, 0.9
-            q_l, q_h = align_ql, align_qh
-            z_l, z_h = torch.quantile(z_gs, q_l), torch.quantile(z_gs, q_h)  # 真实深度的分位数
-            d_l, d_h = torch.quantile(d_sample, q_l), torch.quantile(d_sample, q_h)  # 相对深度的分位数
-
-            # 步骤6：计算对齐参数 a_c (斜率) 和 b_c (截距) [对应Algo 2 Line 9]
-            # 较难理解，为什么可以这么处理，或许是一个改进点---------------------
-            if abs(d_h - d_l) < 1e-6:  # 深度范围过小，避免除零
-                a_c = 1.0
+            if abs(d_h - d_l) < 1e-8:
+                a_c = 0.0
+                b_c = z_gs.median()
             else:
-                a_c = (z_h - z_l) / (d_h - d_l)  # 斜率：将相对深度映射到真实深度
-            b_c = z_l - a_c * d_l  # 截距
+                a_c = (z_h - z_l) / (d_h - d_l)
+                b_c = z_l - a_c * d_l
 
-            # 较难理解，这里也需要仔细对照-----------------------------------
-            # 修正：若原始相关性为负，需翻转斜率（因为之前临时翻转了d_sample）
-            # 推导：z = a_temp*(-d) + b = (-a_temp)*d + b → a_c = -a_temp
-            if is_neg_corr:
-                a_c = -a_c
+            # [安全钳制]
+            # ZoeDepth是正相关的，a_c必须为正。物理尺度差异通常在 0.1 ~ 100 倍之间。
+            a_c = torch.clamp(a_c, min=0.01, max=1000.0)
 
-            # 较难理解，为什么要保存------------------------------------
-            alignment_params.append((a_c, b_c))  # 保存该相机的对齐参数
+            alignment_params.append((a_c, b_c))
 
 
         # =================================================================
@@ -1046,19 +1009,21 @@ class GaussianModel:
             # 记录有效视角数（分母 |C_check|）
             valid_view_counts[valid_indices] += 1
 
-            # 步骤2：从DPT深度图采样并对齐，得到目标深度z_ref [对应Algo 2 Line A.10]
-            #  (1, 1, M, 2)
+            # -----------------------------------------------------------------
+            # 从深度图采样
             grid = ndc[valid_indices].unsqueeze(0).unsqueeze(0)
-            # 采样DPT相对深度
             d_raw = torch.nn.functional.grid_sample(
-                dpt_depth_maps[idx].unsqueeze(0).unsqueeze(0),  # (1, 1, H, W)
+                dpt_depth_maps[idx].unsqueeze(0).unsqueeze(0),
                 grid, align_corners=True, padding_mode="border"
             ).squeeze()
-            # 得到（M,）
 
-            # 应用对齐参数，将相对深度转换为度量深度 z_ref (z_render)
+            # 应用线性变换 Z = a * d + b
+            # 这里的 d_raw 来自 ZoeDepth，是线性的，所以直接乘加即可
             a_c, b_c = alignment_params[idx]
             z_ref = a_c * d_raw + b_c
+
+            # [安全钳制] 防止 z < 0 (相机背面)
+            z_ref = torch.maximum(z_ref, torch.tensor(0.01, device="cuda"))
 
             # 步骤3：计算候选点的真实度量深度 z_metric
             p_view = cand_homo[valid_indices] @ cam.world_view_transform
